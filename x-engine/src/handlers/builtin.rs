@@ -568,7 +568,7 @@ async fn handle_fail(ctx: StepContext) -> Result<Value, StepError> {
 /// Params:
 /// - `url` (string, required): The URL to request.
 /// - `method` (string): HTTP method. Defaults to "GET".
-/// - `body` (string | object | array): Request body for POST/PUT. Strings are sent as-is; objects and arrays are auto-serialized to JSON.
+/// - `body` (string): Request body for POST/PUT.
 /// - `headers` (object): Extra HTTP headers.
 /// - `timeout_ms` (u64): Timeout in milliseconds. Defaults to 10000.
 #[allow(clippy::too_many_lines)]
@@ -596,11 +596,7 @@ async fn handle_http_request(ctx: StepContext) -> Result<Value, StepError> {
         .and_then(Value::as_str)
         .unwrap_or("GET");
 
-    let body_str = match ctx.params.get("body") {
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-        None => String::new(),
-    };
+    let body_str = ctx.params.get("body").and_then(Value::as_str).unwrap_or("");
 
     let timeout = std::time::Duration::from_millis(
         ctx.params
