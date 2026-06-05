@@ -953,4 +953,236 @@ SchedulerConfig {
 
 ---
 
-> 文档版本: v1.0 · 最后更新: 2025-07-16
+---
+
+## 15. 源码阅读路线图
+
+> 以下是逐阶段阅读源码的推荐路径，从最基础的数据类型开始，逐步深入到引擎核心。
+> 每个阶段标注了：目标、关键文件、阅读要点、配套测试。
+
+---
+
+### 阶段 0：准备工作
+
+```bash
+# 跑一遍测试，确保环境正常
+cd x.engine
+cargo test --workspace --lib
+
+# 跑一遍服务，体验实际效果
+cargo run -p x-server
+# curl http://127.0.0.1:8080/health/live
+```
+
+**理解目标**：知道怎么运行、怎么调试、测试在哪。
+
+---
+
+### 阶段 1：领域类型 — x-types（约 120 分钟）
+
+这是整个引擎的**词汇表**。所有数据结构都在这里定义，其他 crate 都依赖它。先读类型定义和测试，不看实现细节。
+
+**阅读顺序：**
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-types/src/ids.rs` | 理解 `SequenceId` / `InstanceId` / `BlockId` 等 ID 类型——引擎中几乎每个函数都用到它们 |
+| 2 | `x-types/src/sequence.rs` | **核心**。理解序列定义的结构：`SequenceDefinition` → `BlockDefinition`（递归枚举）→ `StepDef` + 9 种复合 Block。关注第 58-104 行的结构体和枚举 |
+| 3 | `x-types/src/instance.rs` | 理解 `TaskInstance` 和 `InstanceState` 状态机。看第 56-76 行的 `can_transition_to()`——它编码了所有合法转移 |
+| 4 | `x-types/src/execution.rs` | 理解执行树：`ExecutionNode` + `NodeState`。这是引擎运行时跟踪进度的核心数据结构 |
+| 5 | `x-types/src/context.rs` | 理解 `ExecutionContext`（data/config/audit/runtime）——step handler 能读到什么数据 |
+| 6 | `x-types/src/signal.rs` | 理解信号类型：Pause / Resume / Cancel / UpdateContext / Custom |
+| 7 | `x-types/src/config.rs` | 浏览 `SchedulerConfig` / `EngineConfig`——知道有哪些可配置项即可 |
+| 8 | `x-types/src/error.rs` | 理解 `StorageError` 和 `StepError`（Permanent vs Retryable）的区分 |
+
+**验证**：跑 `cargo test -p x-types`（132 个测试）全部通过。
+
+**跳过**：`api_key.rs` / `audit.rs` / `circuit_breaker.rs` / `credential.rs` / `cron.rs` / `dedupe.rs` / `encryption.rs` / `filter.rs` / `interceptor.rs` / `output.rs` / `plugin.rs` / `pool.rs` / `rate_limit.rs` / `rollback.rs` / `session.rs` / `trigger.rs` / `worker.rs` / `worker_filter.rs` — 这些是保留但非核心的类型，遇到需要时再回来看。
+
+---
+
+### 阶段 2：存储层 — x-storage（约 60 分钟）
+
+理解引擎如何与数据库交互。重点是 **trait 接口**，不是具体 SQL 实现。
+
+**阅读顺序：**
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-storage/src/lib.rs` | **核心**。看 `StorageBackend` trait 和 10+ 个子 trait（SequenceStore / InstanceStore / ExecutionTreeStore / OutputStore / SignalStore / WorkerStore / SchedulingStore / ResourceStore / AdminStore / TelemetryStore）。理解每个 trait 负责什么 |
+| 2 | `x-storage/src/sqlite/mod.rs` | 先看 SQLite 后端（简单），理解 `SqliteStorage` 结构体 |
+| 3 | `x-storage/src/postgres/mod.rs` | 再看 Postgres 后端，看 `PostgresStorage` 结构体和 `run_migrations()` |
+| 4 | `x-storage/src/postgres/instances.rs` | 重点看 `claim_due_instances()`——`SELECT ... FOR UPDATE SKIP LOCKED` 的实现，这是多节点竞争的核心 |
+
+**不要深入阅读**（除非你对具体细节感兴趣）：
+- 每个子 trait 的具体 SQL 实现（`postgres/` 和 `sqlite/` 下的 20+ 文件）
+- `compression.rs` / `encrypting.rs` / `externalizing.rs` — 透传桩
+
+**验证**：跑 `cargo test -p x-storage`（83 个测试）。
+
+---
+
+### 阶段 3：引擎内核 — x-engine（约 300 分钟，核心阶段）
+
+这是最复杂的 crate。**建议严格按顺序阅读**。
+
+#### 3a：表达式和模板引擎（约 45 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/expression.rs` | 看第 336-877 行的 Parser：递归下降解析器。关注 tokenize → parse → evaluate 的流程。理解路径解析（`context.data.x` / `outputs.block.field`）和内置函数 |
+| 2 | `x-engine/src/template.rs` | 看 `resolve()` 函数：如何在 JSON 中递归查找 `{{...}}` 并替换。理解 pipe filter 机制（`upper` / `lower` / `default` / `json` 等） |
+
+**要点**：表达式引擎返回 JSON Value（可以是任何类型），模板引擎返回 String（插值后拼成的字符串）。两者的输出类型不同。
+
+#### 3b：Handler 系统（约 45 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/handlers/mod.rs` | 看 `HandlerRegistry` 和 `StepContext`——理解 handler 的输入输出签名 |
+| 2 | `x-engine/src/handlers/builtin.rs` | 浏览 25+ 个内置 handler 的实现。重点关注 `handle_http_request`（第 575 行），它是 API 编排最常用的 handler |
+| 3 | `x-engine/src/handlers/step_dispatch.rs` | 理解 handler 如何被分发执行，以及 WorkerTask（外部 Worker）机制 |
+| 4 | `x-engine/src/handlers/llm/mod.rs` | 浏览 LLM handler，看多供应商故障转移的实现 |
+
+**跳过**：单个复杂 handler 的细节（agent / memory / mcp 等），第二次迭代再看。
+
+#### 3c：评估器 — 执行树（约 60 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/evaluator/dispatch.rs` | **核心**。`dispatch_block()` 是执行树的心脏——根据 Block 类型分发到不同的执行逻辑。先理解 match 分支 |
+| 2 | `x-engine/src/evaluator/sla.rs` | SLA deadline 检查 |
+| 3 | `x-engine/src/evaluator.rs` | 看 `evaluate()` 主函数：执行树遍历的主循环。理解 `EvalOutcome`（Done / More / Waiting） |
+
+**重点理解**：
+- 执行树的展开过程（`ensure_execution_tree`）
+- 如何通过检查子节点状态来决定父节点的完成状态
+- 快速路径（`scheduler.rs` 中的 `process_instance` 线性 Block 直接执行）vs 树路径
+
+#### 3d：调度器 — Tick Loop（约 90 分钟，最重要的部分）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/scheduler.rs` | **核心中的核心**。阅读顺序：<br>① `run_tick_loop()` — 主循环结构<br>② `process_tick()` — 单 tick 的完整流程（claim → preload → dispatch）<br>③ `process_instance()` — 快速路径（线性 block 直接执行）<br>④ `process_instance_tree()` — 树路径（复合 block 通过 evaluator）<br>⑤ `process_signalled_instances()` — 信号批量处理<br>⑥ `process_waiting_deadlines()` — 等待实例超时检查 |
+| 2 | `x-engine/src/scheduler/step_exec.rs` | 看 `execute_step()` 和 `check_human_input()`——step 执行的详细逻辑 |
+| 3 | `x-engine/src/signals.rs` | 看 `process_signals_prefetched()`——信号如何被消费和执行 |
+
+#### 3e：引擎结构体 + 后台任务（约 30 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/lib.rs` | 看 `Engine` 结构体、`run()` 方法、`spawn_background_tasks()`。理解引擎启动时启动了多少个后台循环 |
+
+**后台任务一览**：
+- 心跳循环（10s）— 节点存活上报
+- 节点回收 — 清理崩溃节点
+- Worker 回收 — 重置过期 WorkerTask
+- 陈旧实例回收 — 恢复卡住的实例
+- Cron 循环 — 定时触发
+- 触发器循环 — 监听外部事件
+- 凭证刷新 — OAuth2 token 刷新
+- GC — 清理过期数据
+
+#### 3f：辅助模块（约 30 分钟，可选）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-engine/src/webhooks.rs` | 发请求的 Webhook 发送器 |
+| 2 | `x-engine/src/lifecycle.rs` | 状态机转移 + 审计日志 |
+| 3 | `x-engine/src/sequence_cache.rs` | 双键 LRU 缓存（by-id + by-name） |
+| 4 | `x-engine/src/preload.rs` | 批量外部化标记回填优化 |
+
+---
+
+### 阶段 4：HTTP API 层 — x-api（约 60 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-api/src/lib.rs` | 看 `build_router()`——路由是怎么组装起来的。理解 `AppState` 结构体 |
+| 2 | `x-api/src/sequences.rs` | 序列 CRUD handler |
+| 3 | `x-api/src/instances/lifecycle.rs` | 实例生命周期 handler：创建、更新状态、重试 |
+| 4 | `x-api/src/instances/signals.rs` | 信号发送端点 |
+| 5 | `x-api/src/streaming.rs` | SSE 流式输出 |
+| 6 | `x-api/src/error.rs` | API 错误类型和 HTTP 状态码映射 |
+
+**要点**：x-api 层很薄，主要是把 HTTP 请求翻译成存储层调用，几乎不含业务逻辑。
+
+---
+
+### 阶段 5：服务端入口 — x-server（约 15 分钟）
+
+| # | 文件 | 要点 |
+|---|---|---|
+| 1 | `x-server/src/main.rs` | 理解启动过程：初始化存储 → 注册 handler → 启动引擎 → 启动 HTTP 服务器 → 等待关闭 |
+
+---
+
+### 阶段 6：进阶深入（第二次迭代）
+
+完成以上 5 个阶段后，你应该对整个代码库有了全局理解。第二次迭代可以专注于：
+
+#### 6a：复合 Block 执行逻辑
+
+| 文件 | 要点 |
+|---|---|
+| `x-engine/src/handlers/parallel.rs` | 如何并发激活子节点 |
+| `x-engine/src/handlers/race.rs` | 竞速逻辑：首完成者胜 vs 首成功者胜 |
+| `x-engine/src/handlers/loop_block.rs` | 循环条件 + break_on + continue_on_error |
+| `x-engine/src/handlers/for_each.rs` | 集合遍历 + item_var 动态绑定 |
+| `x-engine/src/handlers/router.rs` | 条件匹配 + 路由选择 |
+| `x-engine/src/handlers/try_catch.rs` | 异常捕获 + finally 块 |
+| `x-engine/src/handlers/ab_split.rs` | A/B 分流 + 加权随机选择 |
+| `x-engine/src/handlers/cancellation_scope.rs` | 防取消保护 |
+| `x-engine/src/handlers/sub_sequence.rs` | 子流程调用 |
+
+#### 6b：AI/LLM 系列 Handler
+
+| 文件 | 要点 |
+|---|---|
+| `x-engine/src/handlers/llm/mod.rs` | 多供应商 LLM 调用 + 故障转移 |
+| `x-engine/src/handlers/agent.rs` | ReAct Agent 循环 + 检查点持久化 |
+| `x-engine/src/handlers/mcp.rs` | MCP 协议客户端 |
+| `x-engine/src/handlers/memory.rs` | 向量记忆（embed / store / search） |
+
+#### 6c：调度的延迟/窗口/池
+
+| 文件 | 说明 |
+|---|---|
+| `x-engine/src/scheduling/delay.rs` | 延迟执行 + 工作日跳过 + jitter |
+| `x-engine/src/scheduling/send_window.rs` | 发送窗口限制 |
+| `x-engine/src/scheduling/pool.rs` | 资源池 + 权重路由 |
+
+---
+
+### 阶段 7：测试策略（约 30 分钟）
+
+x.engine 的核心代码有极高的测试覆盖率，理解测试模式对阅读和修改代码很有帮助。
+
+| 文件 | 说明 |
+|---|---|
+| `x-engine/src/scheduler/tests.rs` | 调度器最复杂的测试集合：模拟 tick、信号处理、状态转移 |
+| `x-engine/src/evaluator/tests.rs` | 执行树评估的全面测试 |
+| `x-engine/src/expression.rs` | 表达式引擎的 100+ 用例，最直观理解表达式语法的方式 |
+| `x-engine/src/template.rs` | 模板引擎的详尽测试（含所有 pipe filter） |
+| `x-engine/tests/common/mod.rs` | 集成测试辅助函数 |
+
+**测试模式**：引擎层的复杂测试通常使用 `TestBed` 结构体（`scheduler/tests.rs` 中定义），它提供了 mock 存储 + 序列注册 + 实例创建的快捷方法。
+
+---
+
+### 快速索引：按场景找代码
+
+| 你想了解什么 | 去哪里看 |
+|---|---|
+| 一个实例从创建到完成的完整路径 | `x-api/src/instances/lifecycle.rs` → `x-engine/src/scheduler.rs`（process_tick） → `x-engine/src/evaluator.rs`（evaluate） |
+| 如何新增一个 Block 类型 | ① `x-types/src/sequence.rs` 加枚举变体 ② `x-engine/src/evaluator/dispatch.rs` 加 dispatch 分支 ③ 新增 `x-engine/src/handlers/xxx.rs` |
+| 如何新增一个 Handler | ① 实现 `async fn(StepContext) -> Result<Value, StepError>` ② 在 `builtin.rs` 的 `register_builtins()` 注册 |
+| 多节点如何竞争实例 | `x-storage/src/postgres/instances.rs` → `claim_due_instances()` → `FOR UPDATE SKIP LOCKED` |
+| 信号如何触发实例状态变化 | `x-api/src/instances/signals.rs` → `x-engine/src/signals.rs` → 状态转移 |
+| 模板语法支持哪些功能 | `x-engine/src/expression.rs`（表达式计算） + `x-engine/src/template.rs`（字符串插值 + pipe filter） |
+| 人工审批流程 | `x-engine/src/handlers/human_review.rs` + `x-engine/src/scheduler/step_exec.rs`（`check_human_input`） |
+| Agent 循环的工作原理 | `x-engine/src/handlers/agent.rs`（`run_agent_loop`） |
+
+---
+
+> 文档版本: v2.0 · 最后更新: 2025-06-05
