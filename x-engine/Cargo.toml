@@ -1,0 +1,36 @@
+[package]
+name = "x-engine"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+x-types = { path = "../x-types" }
+x-storage = { path = "../x-storage" }
+tokio.workspace = true
+tokio-util.workspace = true
+chrono.workspace = true
+chrono-tz = "0.10"
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+metrics.workspace = true
+moka.workspace = true
+dashmap.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "multipart"] }
+url.workspace = true
+tokio-stream.workspace = true
+base64 = "0.22"
+bytes = "1"
+sha2 = "0.10"
+hmac = "0.12"
+cron = "0.15"
+
+[dev-dependencies]
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tempfile = "3"
+http = "1"

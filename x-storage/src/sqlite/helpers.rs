@@ -1,0 +1,386 @@
+use std::str::FromStr;
+
+use chrono::{DateTime, Utc};
+use sqlx::Row;
+use uuid::Uuid;
+
+use x_types::audit::AuditLogEntry;
+use x_types::checkpoint::Checkpoint;
+use x_types::cluster::{ClusterNode, NodeStatus};
+use x_types::cron::CronSchedule;
+use x_types::error::StorageError;
+use x_types::execution::{BlockType, ExecutionNode, NodeState};
+use x_types::filter::InstanceFilter;
+use x_types::ids::*;
+use x_types::instance::{InstanceState, Priority, TaskInstance};
+use x_types::output::BlockOutput;
+use x_types::pool::{PoolResource, ResourcePool};
+use x_types::session::{Session, SessionState};
+use x_types::signal::Signal;
+use x_types::worker::WorkerTask;
+
+pub(super) fn ts(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
+pub(super) fn parse_ts(s: &str) -> Result<DateTime<Utc>, StorageError> {
+    // Try RFC 3339 first (the canonical format written by ts()).
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    // SQLite's datetime() returns "YYYY-MM-DD HH:MM:SS" (no timezone).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            naive, Utc,
+        ));
+    }
+    Err(StorageError::Query(format!(
+        "failed to parse timestamp: {s}"
+    )))
+}
+
+pub(super) fn parse_ts_opt(s: Option<String>) -> Result<Option<DateTime<Utc>>, StorageError> {
+    match s {
+        Some(v) => Ok(Some(parse_ts(&v)?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_uuid(s: &str) -> Result<Uuid, StorageError> {
+    Uuid::parse_str(s).map_err(|e| StorageError::Query(format!("invalid UUID '{s}': {e}")))
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, StorageError> {
+    serde_json::from_str(s).map_err(StorageError::Serialization)
+}
+
+pub(super) fn row_to_instance(row: &sqlx::sqlite::SqliteRow) -> Result<TaskInstance, StorageError> {
+    Ok(TaskInstance {
+        id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("id"))?),
+        sequence_id: SequenceId::from_uuid(parse_uuid(row.get::<&str, _>("sequence_id"))?),
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        namespace: Namespace::new(row.get::<String, _>("namespace")),
+        // Match Postgres semantics: an unrecognised state string is row
+        // corruption, not a cue to silently resurrect the row as Scheduled.
+        // Masking the corruption here let broken rows leak into claim cycles.
+        state: InstanceState::from_str(row.get::<&str, _>("state")).map_err(StorageError::Query)?,
+        next_fire_at: parse_ts_opt(row.get::<Option<String>, _>("next_fire_at"))?,
+        priority: Priority::try_from(row.get::<i16, _>("priority")).unwrap_or(Priority::Normal),
+        timezone: row.get::<String, _>("timezone"),
+        metadata: parse_json(row.get::<&str, _>("metadata"))?,
+        context: parse_json(row.get::<&str, _>("context"))?,
+        concurrency_key: row.get::<Option<String>, _>("concurrency_key"),
+        max_concurrency: row
+            .get::<Option<i32>, _>("max_concurrency")
+            .map(|v| v as u32),
+        idempotency_key: row.get::<Option<String>, _>("idempotency_key"),
+        session_id: row
+            .get::<Option<String>, _>("session_id")
+            .and_then(|s| Uuid::parse_str(&s).ok()),
+        parent_instance_id: row
+            .get::<Option<String>, _>("parent_instance_id")
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .map(InstanceId::from_uuid),
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+        updated_at: parse_ts(row.get::<&str, _>("updated_at"))?,
+    })
+}
+
+pub(super) fn row_to_node(row: &sqlx::sqlite::SqliteRow) -> Result<ExecutionNode, StorageError> {
+    Ok(ExecutionNode {
+        id: ExecutionNodeId::from_uuid(parse_uuid(row.get::<&str, _>("id"))?),
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        block_id: BlockId::new(row.get::<String, _>("block_id")),
+        parent_id: row
+            .get::<Option<String>, _>("parent_id")
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .map(ExecutionNodeId::from_uuid),
+        block_type: BlockType::from_str(row.get::<&str, _>("block_type"))
+            .unwrap_or(BlockType::Step),
+        branch_index: row.get::<Option<i32>, _>("branch_index").map(|v| v as i16),
+        state: NodeState::from_str(row.get::<&str, _>("state")).unwrap_or(NodeState::Pending),
+        started_at: parse_ts_opt(row.get::<Option<String>, _>("started_at"))?,
+        completed_at: parse_ts_opt(row.get::<Option<String>, _>("completed_at"))?,
+    })
+}
+
+pub(super) fn row_to_sequence(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<x_types::sequence::SequenceDefinition, StorageError> {
+    Ok(x_types::sequence::SequenceDefinition {
+        id: SequenceId::from_uuid(parse_uuid(row.get::<&str, _>("id"))?),
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        namespace: Namespace::new(row.get::<String, _>("namespace")),
+        name: row.get::<String, _>("name"),
+        version: row.get::<i32, _>("version"),
+        deprecated: row.get::<i32, _>("deprecated") != 0,
+        status: row.get::<String, _>("status").parse().unwrap_or_default(),
+        blocks: parse_json(row.get::<&str, _>("blocks"))?,
+        interceptors: row
+            .get::<Option<String>, _>("interceptors")
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_output(row: &sqlx::sqlite::SqliteRow) -> Result<BlockOutput, StorageError> {
+    Ok(BlockOutput {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        block_id: BlockId::new(row.get::<String, _>("block_id")),
+        output: parse_json(row.get::<&str, _>("output"))?,
+        output_ref: row.get::<Option<String>, _>("output_ref"),
+        output_size: row.get::<i64, _>("output_size") as u32,
+        attempt: row.get::<i64, _>("attempt") as u16,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_signal(row: &sqlx::sqlite::SqliteRow) -> Result<Signal, StorageError> {
+    Ok(Signal {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        signal_type: parse_json(row.get::<&str, _>("signal_type"))?,
+        payload: parse_json(row.get::<&str, _>("payload"))?,
+        delivered: row.get::<i32, _>("delivered") != 0,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+        delivered_at: None,
+    })
+}
+
+pub(super) fn row_to_cron(row: &sqlx::sqlite::SqliteRow) -> Result<CronSchedule, StorageError> {
+    Ok(CronSchedule {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        namespace: Namespace::new(row.get::<String, _>("namespace")),
+        sequence_id: SequenceId::from_uuid(parse_uuid(row.get::<&str, _>("sequence_id"))?),
+        cron_expr: row.get::<String, _>("cron_expr"),
+        timezone: row.get::<String, _>("timezone"),
+        enabled: row.get::<i32, _>("enabled") != 0,
+        metadata: parse_json(row.get::<&str, _>("metadata"))?,
+        next_fire_at: parse_ts_opt(row.get::<Option<String>, _>("next_fire_at"))?,
+        last_triggered_at: parse_ts_opt(row.get::<Option<String>, _>("last_triggered_at"))?,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+        updated_at: parse_ts(row.get::<&str, _>("updated_at"))?,
+    })
+}
+
+pub(super) fn row_to_worker_task(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<WorkerTask, StorageError> {
+    use x_types::worker::WorkerTaskState;
+    let state =
+        WorkerTaskState::from_str(row.get::<&str, _>("state")).unwrap_or(WorkerTaskState::Pending);
+    Ok(WorkerTask {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        block_id: BlockId::new(row.get::<String, _>("block_id")),
+        handler_name: row.get::<String, _>("handler_name"),
+        queue_name: row.get::<Option<String>, _>("queue_name"),
+        params: parse_json(row.get::<&str, _>("params"))?,
+        context: parse_json(row.get::<&str, _>("context"))?,
+        attempt: row.get::<i64, _>("attempt") as u16,
+        timeout_ms: row.get::<Option<i64>, _>("timeout_ms"),
+        state,
+        worker_id: row.get::<Option<String>, _>("worker_id"),
+        claimed_at: parse_ts_opt(row.get::<Option<String>, _>("claimed_at"))?,
+        heartbeat_at: parse_ts_opt(row.get::<Option<String>, _>("heartbeat_at"))?,
+        completed_at: parse_ts_opt(row.get::<Option<String>, _>("completed_at"))?,
+        output: row
+            .get::<Option<String>, _>("output")
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        error_message: row.get::<Option<String>, _>("error_message"),
+        error_retryable: row.get::<Option<i32>, _>("error_retryable").map(|v| v != 0),
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_pool(row: &sqlx::sqlite::SqliteRow) -> Result<ResourcePool, StorageError> {
+    use x_types::pool::RotationStrategy;
+    let strategy = RotationStrategy::from_str(&row.get::<String, _>("strategy"))
+        .unwrap_or(RotationStrategy::RoundRobin);
+    Ok(ResourcePool {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        name: row.get::<String, _>("name"),
+        strategy,
+        round_robin_index: row.get::<i64, _>("round_robin_index") as u32,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+        updated_at: parse_ts(row.get::<&str, _>("updated_at"))?,
+    })
+}
+
+pub(super) fn row_to_pool_resource(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PoolResource, StorageError> {
+    Ok(PoolResource {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        pool_id: parse_uuid(row.get::<&str, _>("pool_id"))?,
+        resource_key: ResourceKey::new(row.get::<String, _>("resource_key")),
+        name: row.get::<String, _>("name"),
+        weight: row.get::<i64, _>("weight") as u32,
+        enabled: row.get::<i32, _>("enabled") != 0,
+        daily_cap: row.get::<i64, _>("daily_cap") as u32,
+        daily_usage: row.get::<i64, _>("daily_usage") as u32,
+        daily_usage_date: row
+            .get::<Option<String>, _>("daily_usage_date")
+            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+        warmup_start: row
+            .get::<Option<String>, _>("warmup_start")
+            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+        warmup_days: row.get::<i64, _>("warmup_days") as u32,
+        warmup_start_cap: row.get::<i64, _>("warmup_start_cap") as u32,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_checkpoint(row: &sqlx::sqlite::SqliteRow) -> Result<Checkpoint, StorageError> {
+    Ok(Checkpoint {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        checkpoint_data: parse_json(row.get::<&str, _>("checkpoint_data"))?,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_session(row: &sqlx::sqlite::SqliteRow) -> Result<Session, StorageError> {
+    let state = SessionState::from_str(row.get::<&str, _>("state")).unwrap_or(SessionState::Active);
+    Ok(Session {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        session_key: row.get::<String, _>("session_key"),
+        data: parse_json(row.get::<&str, _>("data"))?,
+        state,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+        updated_at: parse_ts(row.get::<&str, _>("updated_at"))?,
+        expires_at: parse_ts_opt(row.get::<Option<String>, _>("expires_at"))?,
+    })
+}
+
+pub(super) fn row_to_audit(row: &sqlx::sqlite::SqliteRow) -> Result<AuditLogEntry, StorageError> {
+    Ok(AuditLogEntry {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        instance_id: InstanceId::from_uuid(parse_uuid(row.get::<&str, _>("instance_id"))?),
+        tenant_id: TenantId::unchecked(row.get::<String, _>("tenant_id")),
+        event_type: row.get::<String, _>("event_type"),
+        from_state: row.get::<Option<String>, _>("from_state"),
+        to_state: row.get::<Option<String>, _>("to_state"),
+        block_id: row.get::<Option<String>, _>("block_id"),
+        details: parse_json(row.get::<&str, _>("details"))?,
+        created_at: parse_ts(row.get::<&str, _>("created_at"))?,
+    })
+}
+
+pub(super) fn row_to_cluster_node(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ClusterNode, StorageError> {
+    let status = NodeStatus::from_str(row.get::<&str, _>("status")).unwrap_or(NodeStatus::Active);
+    Ok(ClusterNode {
+        id: parse_uuid(row.get::<&str, _>("id"))?,
+        name: row.get::<String, _>("name"),
+        status,
+        registered_at: parse_ts(row.get::<&str, _>("registered_at"))?,
+        last_heartbeat_at: parse_ts(row.get::<&str, _>("last_heartbeat_at"))?,
+        drain: row.get::<i32, _>("drain") != 0,
+    })
+}
+
+/// Build a parameterized SQL filter.
+pub(super) fn apply_filter_sql<'q>(
+    qb: &mut sqlx::QueryBuilder<'q, sqlx::Sqlite>,
+    filter: &'q InstanceFilter,
+) {
+    if let Some(ref tid) = filter.tenant_id {
+        qb.push(" AND tenant_id=");
+        qb.push_bind(tid.as_str());
+    }
+    if let Some(ref ns) = filter.namespace {
+        qb.push(" AND namespace=");
+        qb.push_bind(ns.as_str());
+    }
+    if let Some(ref sid) = filter.sequence_id {
+        qb.push(" AND sequence_id=");
+        qb.push_bind(sid.to_string());
+    }
+    if let Some(ref states) = filter.states {
+        if !states.is_empty() {
+            qb.push(" AND state IN (");
+            let mut separated = qb.separated(",");
+            for state in states {
+                separated.push_bind(state.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+    }
+    if let Some(ref p) = filter.priority {
+        qb.push(" AND priority=");
+        qb.push_bind(*p as i16);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn ts_roundtrips_rfc3339() {
+        let dt = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let s = ts(dt);
+        assert!(s.starts_with("2024-01-15T10:30:00"));
+    }
+
+    #[test]
+    fn parse_ts_rfc3339_ok() {
+        let dt = parse_ts("2024-06-01T12:00:00Z").unwrap();
+        assert_eq!(dt.timestamp(), 1_717_243_200);
+    }
+
+    #[test]
+    fn parse_ts_sqlite_format_ok() {
+        let dt = parse_ts("2024-06-01 12:00:00").unwrap();
+        assert_eq!(dt.timestamp(), 1_717_243_200);
+    }
+
+    #[test]
+    fn parse_ts_invalid_errors() {
+        let err = parse_ts("not-a-date").unwrap_err();
+        assert!(err.to_string().contains("failed to parse timestamp"));
+    }
+
+    #[test]
+    fn parse_ts_opt_some() {
+        let dt = parse_ts_opt(Some("2024-01-01T00:00:00Z".into())).unwrap();
+        assert!(dt.is_some());
+    }
+
+    #[test]
+    fn parse_ts_opt_none() {
+        let dt = parse_ts_opt(None).unwrap();
+        assert!(dt.is_none());
+    }
+
+    #[test]
+    fn parse_uuid_valid() {
+        let uuid = parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn parse_uuid_invalid_errors() {
+        let err = parse_uuid("not-a-uuid").unwrap_err();
+        assert!(err.to_string().contains("invalid UUID"));
+    }
+
+    #[test]
+    fn parse_json_valid() {
+        let val: serde_json::Value = parse_json(r#"{"key": "value"}"#).unwrap();
+        assert_eq!(val["key"], "value");
+    }
+
+    #[test]
+    fn parse_json_invalid_errors() {
+        let err = parse_json::<serde_json::Value>("not json").unwrap_err();
+        assert!(matches!(err, StorageError::Serialization(_)));
+    }
+}

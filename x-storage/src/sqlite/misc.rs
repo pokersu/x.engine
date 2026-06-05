@@ -1,0 +1,455 @@
+use sqlx::Row;
+use std::time::Duration;
+
+use x_types::error::StorageError;
+use x_types::ids::*;
+use x_types::instance::TaskInstance;
+use x_types::worker::WorkerTask;
+
+use super::helpers::{row_to_instance, row_to_worker_task, ts};
+use super::SqliteStorage;
+
+// === Idempotency ===
+
+pub(super) async fn find_by_idempotency_key(
+    storage: &SqliteStorage,
+    tenant_id: &TenantId,
+    idempotency_key: &str,
+) -> Result<Option<TaskInstance>, StorageError> {
+    let row = sqlx::query(
+        "SELECT * FROM task_instances WHERE tenant_id=?1 AND idempotency_key=?2 LIMIT 1",
+    )
+    .bind(tenant_id.as_str())
+    .bind(idempotency_key)
+    .fetch_optional(&storage.pool)
+    .await?;
+    row.as_ref().map(row_to_instance).transpose()
+}
+
+// === Concurrency ===
+
+pub(super) async fn count_running_by_concurrency_key(
+    storage: &SqliteStorage,
+    concurrency_key: &str,
+) -> Result<i64, StorageError> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM task_instances WHERE concurrency_key=?1 AND state='running'",
+    )
+    .bind(concurrency_key)
+    .fetch_one(&storage.pool)
+    .await?;
+    Ok(row.get::<i64, _>("cnt"))
+}
+
+pub(super) async fn count_running_by_concurrency_keys(
+    storage: &SqliteStorage,
+    concurrency_keys: &[&str],
+) -> Result<std::collections::HashMap<String, i64>, StorageError> {
+    if concurrency_keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT concurrency_key, COUNT(*) as cnt FROM task_instances WHERE concurrency_key IN (",
+    );
+    let mut separated = qb.separated(",");
+    for key in concurrency_keys {
+        separated.push_bind(key);
+    }
+    separated.push_unseparated(") AND state='running' GROUP BY concurrency_key");
+    let rows = qb.build().fetch_all(&storage.pool).await?;
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let key: String = row.get("concurrency_key");
+        let cnt: i64 = row.get("cnt");
+        map.insert(key, cnt);
+    }
+    Ok(map)
+}
+
+pub(super) async fn concurrency_position(
+    storage: &SqliteStorage,
+    instance_id: InstanceId,
+    concurrency_key: &str,
+) -> Result<i64, StorageError> {
+    // Order by `(created_at, id)`. IDs are UUIDv7 so the 48-bit timestamp
+    // prefix gives us FIFO-on-`id` at ms granularity — within a single ms
+    // v7 falls back to 74 random bits, so `created_at` leads and `id`
+    // tiebreaks to keep position assignment deterministic for same-ms
+    // arrivals. Matches the Postgres backend.
+    //
+    // Uses a COUNT query instead of fetching all rows and linearly
+    // searching, avoiding O(n) memory and CPU per check on busy keys.
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM task_instances
+         WHERE concurrency_key = ?1 AND state = 'running'
+           AND (created_at < (SELECT created_at FROM task_instances WHERE id = ?2)
+                OR (created_at = (SELECT created_at FROM task_instances WHERE id = ?2)
+                    AND id <= ?2))",
+    )
+    .bind(concurrency_key)
+    .bind(instance_id.into_uuid().to_string())
+    .fetch_one(&storage.pool)
+    .await?;
+    Ok(row.0)
+}
+
+// === Recovery ===
+
+pub(super) async fn recover_stale_instances(
+    storage: &SqliteStorage,
+    stale_threshold: Duration,
+) -> Result<u64, StorageError> {
+    let cutoff = chrono::Utc::now()
+        - chrono::Duration::from_std(stale_threshold)
+            .unwrap_or_else(|_| chrono::Duration::seconds(300));
+    let result = sqlx::query(
+        "UPDATE task_instances SET state='scheduled', updated_at=?1 WHERE state IN ('running', 'waiting') AND updated_at < ?2",
+    )
+    .bind(ts(chrono::Utc::now()))
+    .bind(ts(cutoff))
+    .execute(&storage.pool)
+    .await
+    ?;
+    Ok(result.rows_affected())
+}
+
+// === Sub-Sequences ===
+
+pub(super) async fn get_child_instances(
+    storage: &SqliteStorage,
+    parent_instance_id: InstanceId,
+) -> Result<Vec<TaskInstance>, StorageError> {
+    let rows =
+        sqlx::query("SELECT * FROM task_instances WHERE parent_instance_id=?1 ORDER BY created_at")
+            .bind(parent_instance_id.into_uuid().to_string())
+            .fetch_all(&storage.pool)
+            .await?;
+    rows.iter().map(row_to_instance).collect()
+}
+
+// === Task Queue Routing ===
+
+pub(super) async fn claim_worker_tasks_from_queue(
+    storage: &SqliteStorage,
+    queue_name: &str,
+    handler_name: &str,
+    worker_id: &str,
+    limit: u32,
+) -> Result<Vec<WorkerTask>, StorageError> {
+    let now = ts(chrono::Utc::now());
+    let mut tx = storage.pool.begin().await?;
+    let rows = sqlx::query("SELECT * FROM worker_tasks WHERE queue_name=?1 AND handler_name=?2 AND state='pending' LIMIT ?3")
+        .bind(queue_name)
+        .bind(handler_name)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await
+        ?;
+    let mut tasks: Vec<WorkerTask> = rows
+        .iter()
+        .map(row_to_worker_task)
+        .collect::<Result<Vec<_>, _>>()?;
+    let now_dt = chrono::Utc::now();
+    for t in &mut tasks {
+        t.state = x_types::worker::WorkerTaskState::Claimed;
+        t.worker_id = Some(worker_id.to_string());
+        t.claimed_at = Some(now_dt);
+        t.heartbeat_at = Some(now_dt);
+    }
+    if !tasks.is_empty() {
+        let mut qb = sqlx::QueryBuilder::new("UPDATE worker_tasks SET state='claimed', worker_id=");
+        qb.push_bind(worker_id);
+        qb.push(", claimed_at=");
+        qb.push_bind(&now);
+        qb.push(", heartbeat_at=");
+        qb.push_bind(&now);
+        qb.push(" WHERE id IN (");
+        let mut separated = qb.separated(",");
+        for t in &tasks {
+            separated.push_bind(t.id.to_string());
+        }
+        separated.push_unseparated(")");
+        qb.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(tasks)
+}
+
+/// Tenant-scoped variant — SELECT and UPDATE share a single transaction so
+/// the tenant predicate and claim happen atomically. See
+/// `postgres::workers::claim_for_tenant` for the anti-pattern this
+/// replaces.
+pub(super) async fn claim_worker_tasks_from_queue_for_tenant(
+    storage: &SqliteStorage,
+    queue_name: &str,
+    handler_name: &str,
+    worker_id: &str,
+    tenant_id: &TenantId,
+    limit: u32,
+) -> Result<Vec<WorkerTask>, StorageError> {
+    let now = ts(chrono::Utc::now());
+    let mut tx = storage.pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT wt.* FROM worker_tasks wt
+         JOIN task_instances ti ON ti.id = wt.instance_id
+         WHERE wt.queue_name=?1 AND wt.handler_name=?2 AND wt.state='pending'
+           AND ti.tenant_id=?4
+         LIMIT ?3",
+    )
+    .bind(queue_name)
+    .bind(handler_name)
+    .bind(limit as i64)
+    .bind(tenant_id.as_str())
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut tasks: Vec<WorkerTask> = rows
+        .iter()
+        .map(row_to_worker_task)
+        .collect::<Result<Vec<_>, _>>()?;
+    let now_dt = chrono::Utc::now();
+    for t in &mut tasks {
+        t.state = x_types::worker::WorkerTaskState::Claimed;
+        t.worker_id = Some(worker_id.to_string());
+        t.claimed_at = Some(now_dt);
+        t.heartbeat_at = Some(now_dt);
+    }
+    if !tasks.is_empty() {
+        let mut qb = sqlx::QueryBuilder::new("UPDATE worker_tasks SET state='claimed', worker_id=");
+        qb.push_bind(worker_id);
+        qb.push(", claimed_at=");
+        qb.push_bind(&now);
+        qb.push(", heartbeat_at=");
+        qb.push_bind(&now);
+        qb.push(" WHERE id IN (");
+        let mut separated = qb.separated(",");
+        for t in &tasks {
+            separated.push_bind(t.id.to_string());
+        }
+        separated.push_unseparated(")");
+        qb.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(tasks)
+}
+
+// === Dynamic Step Injection ===
+
+pub(super) async fn inject_blocks(
+    storage: &SqliteStorage,
+    instance_id: InstanceId,
+    blocks_json: &serde_json::Value,
+) -> Result<(), StorageError> {
+    sqlx::query("INSERT OR REPLACE INTO injected_blocks (instance_id, blocks) VALUES (?1, ?2)")
+        .bind(instance_id.into_uuid().to_string())
+        .bind(serde_json::to_string(blocks_json)?)
+        .execute(&storage.pool)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn get_injected_blocks(
+    storage: &SqliteStorage,
+    instance_id: InstanceId,
+) -> Result<Option<serde_json::Value>, StorageError> {
+    let row = sqlx::query("SELECT blocks FROM injected_blocks WHERE instance_id=?1")
+        .bind(instance_id.into_uuid().to_string())
+        .fetch_optional(&storage.pool)
+        .await?;
+    Ok(row
+        .map(|r| serde_json::from_str(r.get::<&str, _>("blocks")))
+        .transpose()?)
+}
+
+pub(super) async fn inject_blocks_at_position(
+    storage: &SqliteStorage,
+    instance_id: InstanceId,
+    new_blocks_json: &serde_json::Value,
+    position: Option<usize>,
+) -> Result<serde_json::Value, StorageError> {
+    let mut tx = storage.pool.begin().await?;
+
+    let final_value = if let Some(pos) = position {
+        // Read current injected blocks within the transaction so a concurrent
+        // writer's snapshot can't slip in between our read and our write.
+        let row = sqlx::query("SELECT blocks FROM injected_blocks WHERE instance_id=?1")
+            .bind(instance_id.into_uuid().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let existing: Option<serde_json::Value> = row
+            .map(|r| serde_json::from_str::<serde_json::Value>(r.get::<&str, _>("blocks")))
+            .transpose()?;
+
+        let mut arr = existing
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+
+        let new_arr = new_blocks_json.as_array().cloned().unwrap_or_default();
+        let insert_at = pos.min(arr.len());
+        for (i, block) in new_arr.into_iter().enumerate() {
+            arr.insert(insert_at + i, block);
+        }
+        serde_json::Value::Array(arr)
+    } else {
+        new_blocks_json.clone()
+    };
+
+    sqlx::query("INSERT OR REPLACE INTO injected_blocks (instance_id, blocks) VALUES (?1, ?2)")
+        .bind(instance_id.into_uuid().to_string())
+        .bind(serde_json::to_string(&final_value)?)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(final_value)
+}
+
+// === Emit Event Dedupe ===
+
+pub(super) async fn record_or_get_emit_dedupe(
+    storage: &SqliteStorage,
+    scope: &crate::DedupeScope,
+    key: &str,
+    candidate_child: InstanceId,
+) -> Result<crate::EmitDedupeOutcome, StorageError> {
+    let scope_kind = scope.kind();
+    let scope_value = scope.value();
+    let cand_str = candidate_child.to_string();
+
+    let inserted = sqlx::query(
+        "INSERT INTO emit_event_dedupe (scope_kind, scope_value, dedupe_key, child_instance_id)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(scope_kind, scope_value, dedupe_key) DO NOTHING",
+    )
+    .bind(scope_kind)
+    .bind(&scope_value)
+    .bind(key)
+    .bind(&cand_str)
+    .execute(&storage.pool)
+    .await?
+    .rows_affected();
+
+    if inserted == 1 {
+        return Ok(crate::EmitDedupeOutcome::Inserted);
+    }
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT child_instance_id FROM emit_event_dedupe
+         WHERE scope_kind = ?1 AND scope_value = ?2 AND dedupe_key = ?3",
+    )
+    .bind(scope_kind)
+    .bind(&scope_value)
+    .bind(key)
+    .fetch_one(&storage.pool)
+    .await?;
+
+    let existing = uuid::Uuid::parse_str(&row.0)
+        .map_err(|e| StorageError::Query(format!("invalid uuid in dedupe row: {e}")))?;
+    Ok(crate::EmitDedupeOutcome::AlreadyExists(
+        InstanceId::from_uuid(existing),
+    ))
+}
+
+/// Atomically record the dedupe row AND insert the child `TaskInstance` in a
+/// single transaction. See `StorageBackend::create_instance_with_dedupe`.
+///
+/// If `(parent, key)` is already taken we return `AlreadyExists` without
+/// touching `task_instances`. Otherwise both rows land in the same commit,
+/// so a crash between the two inserts is impossible.
+pub(super) async fn create_instance_with_dedupe(
+    storage: &SqliteStorage,
+    scope: &crate::DedupeScope,
+    key: &str,
+    instance: &TaskInstance,
+) -> Result<crate::EmitDedupeOutcome, StorageError> {
+    let scope_kind = scope.kind();
+    let scope_value = scope.value();
+    let cand_str = instance.id.into_uuid().to_string();
+
+    // `?` leans on the `From<sqlx::Error> for StorageError` impl so each
+    // failure surfaces with its real variant (PoolTimedOut → PoolExhausted,
+    // etc.) instead of being flattened to `Query`.
+    let mut tx = storage.pool.begin().await?;
+
+    // Insert the child instance FIRST so any FK on emit_event_dedupe is
+    // satisfied (mirrors the Postgres path after migration 031).
+    super::instances::bind_instance_insert(
+        sqlx::query(super::instances::INSTANCE_INSERT_SQL),
+        instance,
+    )?
+    .execute(&mut *tx)
+    .await?;
+
+    let inserted = sqlx::query(
+        "INSERT INTO emit_event_dedupe (scope_kind, scope_value, dedupe_key, child_instance_id)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(scope_kind, scope_value, dedupe_key) DO NOTHING",
+    )
+    .bind(scope_kind)
+    .bind(&scope_value)
+    .bind(key)
+    .bind(&cand_str)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if inserted > 0 {
+        tx.commit().await?;
+        return Ok(crate::EmitDedupeOutcome::Inserted);
+    }
+
+    // Key already taken — rollback the unnecessary child instance, then
+    // look up the existing child id outside the transaction.
+    tx.rollback().await?;
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT child_instance_id FROM emit_event_dedupe
+         WHERE scope_kind = ?1 AND scope_value = ?2 AND dedupe_key = ?3",
+    )
+    .bind(scope_kind)
+    .bind(&scope_value)
+    .bind(key)
+    .fetch_one(&storage.pool)
+    .await?;
+
+    let existing = uuid::Uuid::parse_str(&row.0)
+        .map_err(|e| StorageError::Query(format!("invalid uuid in dedupe row: {e}")))?;
+    Ok(crate::EmitDedupeOutcome::AlreadyExists(
+        InstanceId::from_uuid(existing),
+    ))
+}
+
+/// Delete up to `limit` `emit_event_dedupe` rows whose `created_at` is older
+/// than `older_than`. `created_at` is stored as ISO-8601 text; we normalize
+/// both sides through `datetime(...)` to avoid lexicographic byte comparison
+/// masking real timestamp ordering — same convention as `delete_expired` for
+/// externalized state.
+pub(super) async fn delete_expired_emit_event_dedupe(
+    storage: &SqliteStorage,
+    older_than: chrono::DateTime<chrono::Utc>,
+    limit: u32,
+) -> Result<u64, StorageError> {
+    let cutoff = older_than.to_rfc3339();
+    let result = sqlx::query(
+        r"DELETE FROM emit_event_dedupe
+          WHERE rowid IN (
+              SELECT rowid FROM emit_event_dedupe
+              WHERE datetime(created_at) < datetime(?1)
+              LIMIT ?2
+          )",
+    )
+    .bind(&cutoff)
+    .bind(i64::from(limit))
+    .execute(&storage.pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+// === Health ===
+
+pub(super) async fn ping(storage: &SqliteStorage) -> Result<(), StorageError> {
+    sqlx::query("SELECT 1")
+        .execute(&storage.pool)
+        .await
+        .map_err(|e| StorageError::Connection(e.to_string()))?;
+    Ok(())
+}

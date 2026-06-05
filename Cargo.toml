@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "x-types",
+    "x-storage",
+    "x-engine",
+    "x-api",
+    "x-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "chrono", "json", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+axum = "0.8"
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+async-trait = "0.1"
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+url = "2"
+tokio-stream = "0.1"
+rand = "0.8.6"
+moka = { version = "0.12", features = ["future", "sync"] }
+dashmap = "6"
+futures = "0.3"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

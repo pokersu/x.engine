@@ -1,0 +1,201 @@
+//! Shared request/response types and small helpers for the instances module.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::error::ApiError;
+use x_types::context::ExecutionContext;
+use x_types::ids::{Namespace, SequenceId};
+use x_types::instance::{InstanceState, Priority};
+use x_types::signal::SignalType;
+
+#[derive(Deserialize)]
+pub struct CreateInstanceRequest {
+    pub(crate) sequence_id: SequenceId,
+    pub(crate) namespace: Namespace,
+    #[serde(default)]
+    pub(crate) priority: Priority,
+    #[serde(default = "default_timezone")]
+    pub(crate) timezone: String,
+    #[serde(default)]
+    pub(crate) metadata: serde_json::Value,
+    #[serde(default)]
+    pub(crate) context: ExecutionContext,
+    /// Run this instance in dry-run mode: side-effecting steps (HTTP/LLM/MCP
+    /// calls, agent loops, event/signal emission, memory writes, block
+    /// injection, external plugins) skip their real effect and return a stub;
+    /// control flow and templating run normally. Any sequence can be run dry.
+    /// Default false.
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+    /// When dry-run is on, auto-approve `human_review` gates with the default
+    /// choice so the simulation flows past them instead of pausing. Ignored
+    /// unless `dry_run` is true. Default false.
+    #[serde(default)]
+    pub(crate) dry_run_auto_approve: bool,
+    pub(crate) next_fire_at: Option<DateTime<Utc>>,
+    pub(crate) concurrency_key: Option<String>,
+    pub(crate) max_concurrency: Option<u32>,
+    pub(crate) idempotency_key: Option<String>,
+}
+
+pub fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+#[derive(Deserialize)]
+pub struct BatchCreateRequest {
+    pub(crate) instances: Vec<CreateInstanceRequest>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateStateRequest {
+    pub(crate) state: InstanceState,
+    pub(crate) next_fire_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateContextRequest {
+    pub(crate) context: ExecutionContext,
+}
+
+#[derive(Deserialize)]
+pub struct SendSignalRequest {
+    pub(crate) signal_type: SignalType,
+    #[serde(default)]
+    pub(crate) payload: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct ListQuery {
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) sequence_id: Option<Uuid>,
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default = "default_limit")]
+    pub(crate) limit: u32,
+}
+
+pub const fn default_limit() -> u32 {
+    100
+}
+
+pub struct BulkFilter {
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) sequence_id: Option<Uuid>,
+    pub(crate) states: Option<Vec<InstanceState>>,
+}
+
+pub struct BulkUpdateStateRequest {
+    pub(crate) filter: BulkFilter,
+    pub(crate) state: InstanceState,
+}
+
+pub struct BulkRescheduleRequest {
+    pub(crate) filter: BulkFilter,
+    /// Shift `next_fire_at` by this many seconds (positive = later, negative = earlier).
+    pub(crate) offset_secs: i64,
+}
+
+pub struct CountResponse {
+    pub(crate) count: u64,
+}
+
+/// Parse comma-separated state values.
+pub fn parse_states(s: &str) -> Result<Vec<InstanceState>, ApiError> {
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split(',')
+        .map(|part| {
+            let trimmed = part.trim();
+            match trimmed {
+                "scheduled" => Ok(InstanceState::Scheduled),
+                "running" => Ok(InstanceState::Running),
+                "waiting" => Ok(InstanceState::Waiting),
+                "paused" => Ok(InstanceState::Paused),
+                "completed" => Ok(InstanceState::Completed),
+                "failed" => Ok(InstanceState::Failed),
+                "cancelled" => Ok(InstanceState::Cancelled),
+                other => Err(ApiError::InvalidArgument(format!(
+                    "unknown instance state: {other}"
+                ))),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_state() {
+        assert_eq!(
+            parse_states("running").unwrap(),
+            vec![InstanceState::Running]
+        );
+    }
+
+    #[test]
+    fn parse_multiple_states() {
+        assert_eq!(
+            parse_states("scheduled,running,completed").unwrap(),
+            vec![
+                InstanceState::Scheduled,
+                InstanceState::Running,
+                InstanceState::Completed
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_states_with_whitespace() {
+        assert_eq!(
+            parse_states(" scheduled , running ").unwrap(),
+            vec![InstanceState::Scheduled, InstanceState::Running]
+        );
+    }
+
+    #[test]
+    fn parse_all_states() {
+        let all = "scheduled,running,waiting,paused,completed,failed,cancelled";
+        assert_eq!(
+            parse_states(all).unwrap(),
+            vec![
+                InstanceState::Scheduled,
+                InstanceState::Running,
+                InstanceState::Waiting,
+                InstanceState::Paused,
+                InstanceState::Completed,
+                InstanceState::Failed,
+                InstanceState::Cancelled,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_empty_string_returns_empty() {
+        assert_eq!(parse_states("").unwrap(), Vec::<InstanceState>::new());
+    }
+
+    #[test]
+    fn parse_unknown_state_errors() {
+        let err = parse_states("running,unknown").unwrap_err();
+        assert!(err.to_string().contains("unknown instance state: unknown"));
+    }
+
+    #[test]
+    fn default_limit_is_100() {
+        assert_eq!(default_limit(), 100);
+    }
+
+    #[test]
+    fn default_timezone_is_utc() {
+        assert_eq!(default_timezone(), "UTC");
+    }
+}

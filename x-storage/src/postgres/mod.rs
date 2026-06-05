@@ -1,0 +1,1956 @@
+// Postgres uses i32 for integer columns; our domain types use u32.
+// The values are always small enough that wrapping/sign-loss cannot occur.
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+
+mod api_keys;
+mod audit;
+mod checkpoints;
+mod circuit_breakers;
+mod cluster;
+mod credentials;
+mod cron;
+mod execution_tree;
+mod externalized;
+mod instances;
+mod kv_state;
+mod misc;
+mod outputs;
+mod plugins;
+mod pools;
+mod rate_limits;
+mod rows;
+mod sequences;
+mod sessions;
+mod signals;
+mod triggers;
+mod workers;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use std::time::Duration;
+use uuid::Uuid;
+
+use x_types::cron::CronSchedule;
+use x_types::error::StorageError;
+use x_types::execution::{ExecutionNode, NodeState};
+use x_types::filter::{InstanceFilter, Pagination};
+use x_types::ids::{
+    BlockId, ExecutionNodeId, InstanceId, Namespace, ResourceKey, SequenceId, TenantId,
+};
+use x_types::instance::{InstanceState, TaskInstance};
+use x_types::output::BlockOutput;
+use x_types::rate_limit::{RateLimit, RateLimitCheck};
+use x_types::sequence::SequenceDefinition;
+use x_types::signal::Signal;
+use x_types::worker::WorkerTask;
+
+pub struct PostgresStorage {
+    pub(crate) pool: PgPool,
+    /// Optional durable artifact backend (local FS / S3). `None` → artifact
+    /// methods return `Unsupported`.
+    artifact_store: Option<std::sync::Arc<crate::artifacts::ObjectArtifactStore>>,
+}
+
+impl PostgresStorage {
+    /// Attach a durable artifact backend (builder-style).
+    #[must_use]
+    pub fn with_artifact_store(
+        mut self,
+        store: std::sync::Arc<crate::artifacts::ObjectArtifactStore>,
+    ) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    pub async fn new(
+        database_url: &str,
+        max_connections: u32,
+        search_path: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        Self::with_min_connections(database_url, max_connections, 2, search_path).await
+    }
+
+    #[allow(unknown_lints, clippy::duration_suboptimal_units)]
+    pub async fn with_min_connections(
+        database_url: &str,
+        max_connections: u32,
+        min_connections: u32,
+        search_path: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let mut pool_opts = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .min_connections(min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .idle_timeout(std::time::Duration::from_secs(300));
+
+        if let Some(schema) = search_path {
+            if !schema
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Err(StorageError::Connection(format!(
+                    "Invalid search_path schema name: {schema}"
+                )));
+            }
+            let search_path_value = format!("\"{schema}\", public");
+            pool_opts = pool_opts.after_connect(move |conn, _meta| {
+                let search_path_value = search_path_value.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(&search_path_value)
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        let pool = pool_opts
+            .connect(database_url)
+            .await
+            .map_err(|e| StorageError::Connection(e.to_string()))?;
+
+        Ok(Self {
+            pool,
+            artifact_store: None,
+        })
+    }
+
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn run_migrations(&self) -> Result<(), StorageError> {
+        sqlx::migrate!("../migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|e| StorageError::Migration(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Sub-trait 1: SequenceStore
+// ============================================================================
+
+#[async_trait]
+impl crate::SequenceStore for PostgresStorage {
+    async fn create_sequence(&self, seq: &SequenceDefinition) -> Result<(), StorageError> {
+        sequences::create(self, seq).await
+    }
+
+    async fn get_sequence(
+        &self,
+        id: SequenceId,
+    ) -> Result<Option<SequenceDefinition>, StorageError> {
+        sequences::get(self, id).await
+    }
+
+    async fn get_sequence_by_name(
+        &self,
+        tenant_id: &TenantId,
+        namespace: &Namespace,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<SequenceDefinition>, StorageError> {
+        sequences::get_by_name(self, tenant_id, namespace, name, version).await
+    }
+
+    async fn list_sequence_versions(
+        &self,
+        tenant_id: &TenantId,
+        namespace: &Namespace,
+        name: &str,
+    ) -> Result<Vec<SequenceDefinition>, StorageError> {
+        sequences::list_versions(self, tenant_id, namespace, name).await
+    }
+
+    async fn list_sequences(
+        &self,
+        tenant_id: Option<&TenantId>,
+        namespace: Option<&Namespace>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SequenceDefinition>, StorageError> {
+        sequences::list_all(self, tenant_id, namespace, limit, offset).await
+    }
+
+    async fn deprecate_sequence(&self, id: SequenceId) -> Result<(), StorageError> {
+        sequences::deprecate(self, id).await
+    }
+
+    async fn update_sequence_status(
+        &self,
+        id: SequenceId,
+        status: &str,
+    ) -> Result<(), StorageError> {
+        sequences::update_status(self, id, status).await
+    }
+
+    async fn delete_sequence(&self, id: SequenceId) -> Result<(), StorageError> {
+        sequences::delete(self, id).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 2: InstanceStore
+// ============================================================================
+
+#[async_trait]
+impl crate::InstanceStore for PostgresStorage {
+    async fn create_instance(&self, instance: &TaskInstance) -> Result<(), StorageError> {
+        instances::create(self, instance).await
+    }
+
+    async fn create_instances_batch(
+        &self,
+        instances: &[TaskInstance],
+    ) -> Result<u64, StorageError> {
+        instances::create_batch(self, instances).await
+    }
+
+    async fn create_instance_externalized(
+        &self,
+        instance: &TaskInstance,
+        threshold_bytes: u32,
+    ) -> Result<(), StorageError> {
+        instances::create_externalized(self, instance, threshold_bytes).await
+    }
+
+    async fn create_instances_batch_externalized(
+        &self,
+        instances: &[TaskInstance],
+        threshold_bytes: u32,
+    ) -> Result<u64, StorageError> {
+        instances::create_batch_externalized(self, instances, threshold_bytes).await
+    }
+
+    async fn get_instance(&self, id: InstanceId) -> Result<Option<TaskInstance>, StorageError> {
+        instances::get(self, id).await
+    }
+
+    async fn claim_due_instances(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+        max_per_tenant: u32,
+    ) -> Result<Vec<TaskInstance>, StorageError> {
+        instances::claim_due(self, now, limit, max_per_tenant).await
+    }
+
+    async fn update_instance_state(
+        &self,
+        id: InstanceId,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StorageError> {
+        instances::update_state(self, id, new_state, next_fire_at).await
+    }
+
+    async fn batch_reschedule_instances(
+        &self,
+        ids: &[InstanceId],
+        fire_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        instances::batch_reschedule(self, ids, fire_at).await
+    }
+
+    async fn conditional_update_instance_state(
+        &self,
+        id: InstanceId,
+        expected_state: InstanceState,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, StorageError> {
+        instances::conditional_update_state(self, id, expected_state, new_state, next_fire_at).await
+    }
+
+    async fn update_instance_context(
+        &self,
+        id: InstanceId,
+        context: &x_types::context::ExecutionContext,
+    ) -> Result<(), StorageError> {
+        instances::update_context(self, id, context).await
+    }
+
+    async fn update_instance_context_cas(
+        &self,
+        id: InstanceId,
+        context: &x_types::context::ExecutionContext,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        instances::update_context_cas(self, id, context, expected_updated_at).await
+    }
+
+    async fn update_instance_started_at(
+        &self,
+        id: InstanceId,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        instances::update_started_at(self, id, started_at).await
+    }
+
+    async fn update_instance_current_step_started_at(
+        &self,
+        id: InstanceId,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        instances::update_current_step_started_at(self, id, ts).await
+    }
+
+    async fn update_instance_context_externalized(
+        &self,
+        id: InstanceId,
+        context: &x_types::context::ExecutionContext,
+        threshold_bytes: u32,
+    ) -> Result<(), StorageError> {
+        instances::update_context_externalized(self, id, context, threshold_bytes).await
+    }
+
+    async fn update_instance_sequence(
+        &self,
+        id: InstanceId,
+        new_sequence_id: SequenceId,
+    ) -> Result<(), StorageError> {
+        instances::update_sequence(self, id, new_sequence_id).await
+    }
+
+    async fn merge_context_data(
+        &self,
+        id: InstanceId,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        instances::merge_context_data(self, id, key, value).await
+    }
+
+    async fn list_instances(
+        &self,
+        filter: &InstanceFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<TaskInstance>, StorageError> {
+        instances::list(self, filter, pagination).await
+    }
+
+    async fn list_waiting_with_trees(
+        &self,
+        filter: &InstanceFilter,
+        pagination: &Pagination,
+    ) -> Result<Vec<(TaskInstance, Vec<ExecutionNode>)>, StorageError> {
+        instances::list_waiting_with_trees(self, filter, pagination).await
+    }
+
+    async fn count_instances(&self, filter: &InstanceFilter) -> Result<u64, StorageError> {
+        instances::count(self, filter).await
+    }
+
+    async fn bulk_update_state(
+        &self,
+        filter: &InstanceFilter,
+        new_state: InstanceState,
+    ) -> Result<u64, StorageError> {
+        instances::bulk_update_state(self, filter, new_state).await
+    }
+
+    async fn bulk_reschedule(
+        &self,
+        filter: &InstanceFilter,
+        offset_secs: i64,
+    ) -> Result<u64, StorageError> {
+        instances::bulk_reschedule(self, filter, offset_secs).await
+    }
+
+    async fn find_by_idempotency_key(
+        &self,
+        tenant_id: &TenantId,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskInstance>, StorageError> {
+        misc::find_by_idempotency_key(self, tenant_id, idempotency_key).await
+    }
+
+    async fn count_running_by_concurrency_key(
+        &self,
+        concurrency_key: &str,
+    ) -> Result<i64, StorageError> {
+        misc::count_running_by_concurrency_key(self, concurrency_key).await
+    }
+
+    async fn count_running_by_concurrency_keys(
+        &self,
+        concurrency_keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, i64>, StorageError> {
+        misc::count_running_by_concurrency_keys(self, concurrency_keys).await
+    }
+
+    async fn concurrency_position(
+        &self,
+        instance_id: InstanceId,
+        concurrency_key: &str,
+    ) -> Result<i64, StorageError> {
+        misc::concurrency_position(self, instance_id, concurrency_key).await
+    }
+
+    async fn recover_stale_instances(
+        &self,
+        stale_threshold: Duration,
+    ) -> Result<u64, StorageError> {
+        misc::recover_stale_instances(self, stale_threshold).await
+    }
+
+    async fn get_child_instances(
+        &self,
+        parent_instance_id: InstanceId,
+    ) -> Result<Vec<TaskInstance>, StorageError> {
+        misc::get_child_instances(self, parent_instance_id).await
+    }
+
+    async fn inject_blocks(
+        &self,
+        instance_id: InstanceId,
+        blocks_json: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        misc::inject_blocks(self, instance_id, blocks_json).await
+    }
+
+    async fn inject_blocks_at_position(
+        &self,
+        instance_id: InstanceId,
+        new_blocks_json: &serde_json::Value,
+        position: Option<usize>,
+    ) -> Result<serde_json::Value, StorageError> {
+        misc::inject_blocks_at_position(self, instance_id, new_blocks_json, position).await
+    }
+
+    async fn get_injected_blocks(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        misc::get_injected_blocks(self, instance_id).await
+    }
+
+    async fn record_or_get_emit_dedupe(
+        &self,
+        scope: &crate::DedupeScope,
+        key: &str,
+        candidate_child: InstanceId,
+    ) -> Result<crate::EmitDedupeOutcome, StorageError> {
+        misc::record_or_get_emit_dedupe(self, scope, key, candidate_child).await
+    }
+
+    async fn create_instance_with_dedupe(
+        &self,
+        scope: &crate::DedupeScope,
+        key: &str,
+        instance: &TaskInstance,
+    ) -> Result<crate::EmitDedupeOutcome, StorageError> {
+        misc::create_instance_with_dedupe(self, scope, key, instance).await
+    }
+
+    async fn delete_expired_emit_event_dedupe(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+        limit: u32,
+    ) -> Result<u64, StorageError> {
+        misc::delete_expired_emit_event_dedupe(self, older_than, limit).await
+    }
+
+    async fn batch_save_externalized_state(
+        &self,
+        instance_id: InstanceId,
+        entries: &[(String, serde_json::Value)],
+    ) -> Result<(), StorageError> {
+        externalized::batch_save(self, instance_id, entries).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 3: ExecutionTreeStore
+// ============================================================================
+
+#[async_trait]
+impl crate::ExecutionTreeStore for PostgresStorage {
+    async fn create_execution_node(&self, node: &ExecutionNode) -> Result<(), StorageError> {
+        execution_tree::create_node(self, node).await
+    }
+
+    async fn create_execution_nodes_batch(
+        &self,
+        nodes: &[ExecutionNode],
+    ) -> Result<(), StorageError> {
+        execution_tree::create_batch(self, nodes).await
+    }
+
+    async fn get_execution_tree(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<ExecutionNode>, StorageError> {
+        execution_tree::get_tree(self, instance_id).await
+    }
+
+    async fn update_node_state(
+        &self,
+        node_id: ExecutionNodeId,
+        state: NodeState,
+    ) -> Result<(), StorageError> {
+        execution_tree::update_node_state(self, node_id, state).await
+    }
+
+    async fn batch_activate_nodes(&self, node_ids: &[ExecutionNodeId]) -> Result<(), StorageError> {
+        execution_tree::batch_activate_nodes(self, node_ids).await
+    }
+
+    async fn update_nodes_state(
+        &self,
+        node_ids: &[ExecutionNodeId],
+        state: NodeState,
+    ) -> Result<(), StorageError> {
+        execution_tree::update_nodes_state(self, node_ids, state).await
+    }
+
+    async fn get_children(
+        &self,
+        parent_id: ExecutionNodeId,
+    ) -> Result<Vec<ExecutionNode>, StorageError> {
+        execution_tree::get_children(self, parent_id).await
+    }
+
+    async fn delete_execution_tree(&self, instance_id: InstanceId) -> Result<(), StorageError> {
+        execution_tree::delete_tree(self, instance_id).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 4: OutputStore
+// ============================================================================
+
+#[async_trait]
+impl crate::OutputStore for PostgresStorage {
+    async fn save_block_output(&self, output: &BlockOutput) -> Result<(), StorageError> {
+        outputs::save(self, output).await
+    }
+
+    async fn get_block_output(
+        &self,
+        instance_id: InstanceId,
+        block_id: &BlockId,
+    ) -> Result<Option<BlockOutput>, StorageError> {
+        outputs::get(self, instance_id, block_id).await
+    }
+
+    async fn get_block_outputs_batch(
+        &self,
+        keys: &[(InstanceId, BlockId)],
+    ) -> Result<std::collections::HashMap<(InstanceId, BlockId), BlockOutput>, StorageError> {
+        outputs::get_batch(self, keys).await
+    }
+
+    async fn get_all_outputs(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<BlockOutput>, StorageError> {
+        outputs::get_all(self, instance_id).await
+    }
+
+    async fn get_outputs_after_created_at(
+        &self,
+        instance_id: InstanceId,
+        after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<BlockOutput>, StorageError> {
+        outputs::get_after_created_at(self, instance_id, after).await
+    }
+
+    async fn get_completed_block_ids(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<BlockId>, StorageError> {
+        outputs::get_completed_ids(self, instance_id).await
+    }
+
+    async fn get_completed_block_ids_batch(
+        &self,
+        instance_ids: &[InstanceId],
+    ) -> Result<std::collections::HashMap<InstanceId, Vec<BlockId>>, StorageError> {
+        outputs::get_completed_ids_batch(self, instance_ids).await
+    }
+
+    async fn save_output_and_transition(
+        &self,
+        output: &BlockOutput,
+        instance_id: InstanceId,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StorageError> {
+        outputs::save_output_and_transition(self, output, instance_id, new_state, next_fire_at)
+            .await
+    }
+
+    async fn save_output_merge_context_and_transition(
+        &self,
+        output: &BlockOutput,
+        instance_id: InstanceId,
+        context: &x_types::context::ExecutionContext,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StorageError> {
+        outputs::save_output_merge_context_and_transition(
+            self,
+            output,
+            instance_id,
+            context,
+            new_state,
+            next_fire_at,
+        )
+        .await
+    }
+
+    async fn save_output_complete_node_and_transition(
+        &self,
+        output: &BlockOutput,
+        node_id: x_types::ids::ExecutionNodeId,
+        instance_id: InstanceId,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StorageError> {
+        outputs::save_output_complete_node_and_transition(
+            self,
+            output,
+            node_id,
+            instance_id,
+            new_state,
+            next_fire_at,
+        )
+        .await
+    }
+
+    async fn save_output_complete_node_merge_context_and_transition(
+        &self,
+        output: &BlockOutput,
+        node_id: x_types::ids::ExecutionNodeId,
+        instance_id: InstanceId,
+        context: &x_types::context::ExecutionContext,
+        new_state: InstanceState,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StorageError> {
+        outputs::save_output_complete_node_merge_context_and_transition(
+            self,
+            output,
+            node_id,
+            instance_id,
+            context,
+            new_state,
+            next_fire_at,
+        )
+        .await
+    }
+
+    async fn delete_block_outputs(
+        &self,
+        instance_id: InstanceId,
+        block_id: &BlockId,
+    ) -> Result<u64, StorageError> {
+        outputs::delete_for_block(self, instance_id, block_id).await
+    }
+
+    async fn delete_block_outputs_batch(
+        &self,
+        instance_id: InstanceId,
+        block_ids: &[BlockId],
+    ) -> Result<u64, StorageError> {
+        outputs::delete_for_blocks(self, instance_id, block_ids).await
+    }
+
+    async fn delete_all_block_outputs(&self, instance_id: InstanceId) -> Result<u64, StorageError> {
+        outputs::delete_all_for_instance(self, instance_id).await
+    }
+
+    async fn delete_sentinel_block_outputs(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<u64, StorageError> {
+        outputs::delete_sentinels_for_instance(self, instance_id).await
+    }
+
+    async fn delete_block_output_by_id(&self, id: Uuid) -> Result<(), StorageError> {
+        outputs::delete_by_id(self, id).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 5: SignalStore
+// ============================================================================
+
+#[async_trait]
+impl crate::SignalStore for PostgresStorage {
+    async fn enqueue_signal(&self, signal: &Signal) -> Result<(), StorageError> {
+        signals::enqueue(self, signal).await
+    }
+
+    async fn enqueue_signal_if_active(&self, signal: &Signal) -> Result<(), StorageError> {
+        signals::enqueue_if_active(self, signal).await
+    }
+
+    async fn get_pending_signals(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<Signal>, StorageError> {
+        signals::get_pending(self, instance_id).await
+    }
+
+    async fn get_pending_signals_batch(
+        &self,
+        instance_ids: &[InstanceId],
+    ) -> Result<std::collections::HashMap<InstanceId, Vec<Signal>>, StorageError> {
+        signals::get_pending_batch(self, instance_ids).await
+    }
+
+    async fn mark_signal_delivered(&self, signal_id: Uuid) -> Result<(), StorageError> {
+        signals::mark_delivered(self, signal_id).await
+    }
+
+    async fn mark_signals_delivered(&self, signal_ids: &[Uuid]) -> Result<(), StorageError> {
+        signals::mark_delivered_batch(self, signal_ids).await
+    }
+
+    async fn get_signalled_instance_ids(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(InstanceId, InstanceState)>, StorageError> {
+        signals::get_signalled_instance_ids(self, limit).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 6: WorkerStore
+// ============================================================================
+
+#[async_trait]
+impl crate::WorkerStore for PostgresStorage {
+    async fn create_worker_task(&self, task: &WorkerTask) -> Result<(), StorageError> {
+        workers::create(self, task).await
+    }
+
+    async fn get_worker_task(&self, task_id: Uuid) -> Result<Option<WorkerTask>, StorageError> {
+        workers::get(self, task_id).await
+    }
+
+    async fn claim_worker_tasks(
+        &self,
+        handler_name: &str,
+        worker_id: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkerTask>, StorageError> {
+        workers::claim(self, handler_name, worker_id, limit).await
+    }
+
+    async fn claim_worker_tasks_for_tenant(
+        &self,
+        handler_name: &str,
+        worker_id: &str,
+        tenant_id: &x_types::TenantId,
+        limit: u32,
+    ) -> Result<Vec<WorkerTask>, StorageError> {
+        workers::claim_for_tenant(self, handler_name, worker_id, tenant_id, limit).await
+    }
+
+    async fn complete_worker_task(
+        &self,
+        task_id: Uuid,
+        worker_id: &str,
+        output: &serde_json::Value,
+    ) -> Result<bool, StorageError> {
+        workers::complete(self, task_id, worker_id, output).await
+    }
+
+    async fn fail_worker_task(
+        &self,
+        task_id: Uuid,
+        worker_id: &str,
+        message: &str,
+        retryable: bool,
+    ) -> Result<bool, StorageError> {
+        workers::fail(self, task_id, worker_id, message, retryable).await
+    }
+
+    async fn heartbeat_worker_task(
+        &self,
+        task_id: Uuid,
+        worker_id: &str,
+    ) -> Result<bool, StorageError> {
+        workers::heartbeat(self, task_id, worker_id).await
+    }
+
+    async fn delete_worker_task(&self, task_id: Uuid) -> Result<(), StorageError> {
+        workers::delete(self, task_id).await
+    }
+
+    async fn retry_worker_task(
+        &self,
+        old_task_id: Uuid,
+        new_task: &WorkerTask,
+        node_id: Option<ExecutionNodeId>,
+        instance_id: InstanceId,
+        fire_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        workers::retry(self, old_task_id, new_task, node_id, instance_id, fire_at).await
+    }
+
+    async fn reap_stale_worker_tasks(
+        &self,
+        stale_threshold: Duration,
+    ) -> Result<u64, StorageError> {
+        workers::reap_stale(self, stale_threshold).await
+    }
+
+    async fn expire_timed_out_worker_tasks(&self) -> Result<u64, StorageError> {
+        workers::expire_timed_out(self).await
+    }
+
+    async fn cancel_worker_tasks_for_block(
+        &self,
+        instance_id: Uuid,
+        block_id: &str,
+    ) -> Result<u64, StorageError> {
+        workers::cancel_for_block(self, instance_id, block_id).await
+    }
+
+    async fn cancel_worker_tasks_for_blocks(
+        &self,
+        instance_id: Uuid,
+        block_ids: &[String],
+    ) -> Result<u64, StorageError> {
+        workers::cancel_for_blocks(self, instance_id, block_ids).await
+    }
+
+    async fn list_worker_tasks(
+        &self,
+        filter: &x_types::worker_filter::WorkerTaskFilter,
+        pagination: &x_types::filter::Pagination,
+    ) -> Result<Vec<WorkerTask>, StorageError> {
+        workers::list(self, filter, pagination).await
+    }
+
+    async fn worker_task_stats(
+        &self,
+        tenant_id: Option<&x_types::ids::TenantId>,
+    ) -> Result<x_types::worker_filter::WorkerTaskStats, StorageError> {
+        workers::stats(self, tenant_id).await
+    }
+
+    async fn claim_worker_tasks_from_queue(
+        &self,
+        queue_name: &str,
+        handler_name: &str,
+        worker_id: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkerTask>, StorageError> {
+        misc::claim_worker_tasks_from_queue(self, queue_name, handler_name, worker_id, limit).await
+    }
+
+    async fn claim_worker_tasks_from_queue_for_tenant(
+        &self,
+        queue_name: &str,
+        handler_name: &str,
+        worker_id: &str,
+        tenant_id: &x_types::TenantId,
+        limit: u32,
+    ) -> Result<Vec<WorkerTask>, StorageError> {
+        misc::claim_worker_tasks_from_queue_for_tenant(
+            self,
+            queue_name,
+            handler_name,
+            worker_id,
+            tenant_id,
+            limit,
+        )
+        .await
+    }
+}
+
+// ============================================================================
+// Sub-trait 7: SchedulingStore
+// ============================================================================
+
+#[async_trait]
+impl crate::SchedulingStore for PostgresStorage {
+    async fn create_cron_schedule(&self, schedule: &CronSchedule) -> Result<(), StorageError> {
+        cron::create(self, schedule).await
+    }
+
+    async fn get_cron_schedule(&self, id: Uuid) -> Result<Option<CronSchedule>, StorageError> {
+        cron::get(self, id).await
+    }
+
+    async fn list_cron_schedules(
+        &self,
+        tenant_id: Option<&TenantId>,
+        limit: u32,
+    ) -> Result<Vec<CronSchedule>, StorageError> {
+        cron::list(self, tenant_id, limit).await
+    }
+
+    async fn update_cron_schedule(&self, schedule: &CronSchedule) -> Result<(), StorageError> {
+        cron::update(self, schedule).await
+    }
+
+    async fn delete_cron_schedule(&self, id: Uuid) -> Result<(), StorageError> {
+        cron::delete(self, id).await
+    }
+
+    async fn claim_due_cron_schedules(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<CronSchedule>, StorageError> {
+        cron::claim_due(self, now).await
+    }
+
+    async fn update_cron_fire_times(
+        &self,
+        id: Uuid,
+        last_triggered_at: DateTime<Utc>,
+        next_fire_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        cron::update_fire_times(self, id, last_triggered_at, next_fire_at).await
+    }
+
+    async fn check_rate_limit(
+        &self,
+        tenant_id: &TenantId,
+        resource_key: &ResourceKey,
+        now: DateTime<Utc>,
+    ) -> Result<RateLimitCheck, StorageError> {
+        rate_limits::check_rate_limit(self, tenant_id, resource_key, now).await
+    }
+
+    async fn upsert_rate_limit(&self, limit: &RateLimit) -> Result<(), StorageError> {
+        rate_limits::upsert_rate_limit(self, limit).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 8: AdminStore
+// ============================================================================
+
+#[async_trait]
+impl crate::AdminStore for PostgresStorage {
+    async fn create_session(
+        &self,
+        session: &x_types::session::Session,
+    ) -> Result<(), StorageError> {
+        sessions::create(self, session).await
+    }
+
+    async fn get_session(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<x_types::session::Session>, StorageError> {
+        sessions::get(self, id).await
+    }
+
+    async fn get_session_by_key(
+        &self,
+        tenant_id: &TenantId,
+        session_key: &str,
+    ) -> Result<Option<x_types::session::Session>, StorageError> {
+        sessions::get_by_key(self, tenant_id, session_key).await
+    }
+
+    async fn update_session_data(
+        &self,
+        id: Uuid,
+        data: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        sessions::update_data(self, id, data).await
+    }
+
+    async fn update_session_state(
+        &self,
+        id: Uuid,
+        state: x_types::session::SessionState,
+    ) -> Result<(), StorageError> {
+        sessions::update_state(self, id, state).await
+    }
+
+    async fn list_session_instances(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<TaskInstance>, StorageError> {
+        sessions::list_instances(self, session_id).await
+    }
+
+    async fn create_plugin(
+        &self,
+        plugin: &x_types::plugin::PluginDef,
+    ) -> Result<(), StorageError> {
+        plugins::create(self, plugin).await
+    }
+
+    async fn get_plugin(
+        &self,
+        name: &str,
+    ) -> Result<Option<x_types::plugin::PluginDef>, StorageError> {
+        plugins::get(self, name).await
+    }
+
+    async fn list_plugins(
+        &self,
+        tenant_id: Option<&TenantId>,
+    ) -> Result<Vec<x_types::plugin::PluginDef>, StorageError> {
+        plugins::list(self, tenant_id).await
+    }
+
+    async fn update_plugin(
+        &self,
+        plugin: &x_types::plugin::PluginDef,
+    ) -> Result<(), StorageError> {
+        plugins::update(self, plugin).await
+    }
+
+    async fn delete_plugin(&self, name: &str) -> Result<(), StorageError> {
+        plugins::delete(self, name).await
+    }
+
+    async fn create_trigger(
+        &self,
+        trigger: &x_types::trigger::TriggerDef,
+    ) -> Result<(), StorageError> {
+        triggers::create(self, trigger).await
+    }
+
+    async fn get_trigger(
+        &self,
+        slug: &str,
+    ) -> Result<Option<x_types::trigger::TriggerDef>, StorageError> {
+        triggers::get(self, slug).await
+    }
+
+    async fn list_triggers(
+        &self,
+        tenant_id: Option<&TenantId>,
+        limit: u32,
+    ) -> Result<Vec<x_types::trigger::TriggerDef>, StorageError> {
+        triggers::list(self, tenant_id, limit).await
+    }
+
+    async fn update_trigger(
+        &self,
+        trigger: &x_types::trigger::TriggerDef,
+    ) -> Result<(), StorageError> {
+        triggers::update(self, trigger).await
+    }
+
+    async fn delete_trigger(&self, slug: &str) -> Result<(), StorageError> {
+        triggers::delete(self, slug).await
+    }
+
+    async fn create_credential(
+        &self,
+        credential: &x_types::credential::CredentialDef,
+    ) -> Result<(), StorageError> {
+        credentials::create(self, credential).await
+    }
+
+    async fn get_credential(
+        &self,
+        id: &str,
+    ) -> Result<Option<x_types::credential::CredentialDef>, StorageError> {
+        credentials::get(self, id).await
+    }
+
+    async fn list_credentials(
+        &self,
+        tenant_id: Option<&TenantId>,
+        limit: u32,
+    ) -> Result<Vec<x_types::credential::CredentialDef>, StorageError> {
+        credentials::list(self, tenant_id, limit).await
+    }
+
+    async fn update_credential(
+        &self,
+        credential: &x_types::credential::CredentialDef,
+    ) -> Result<(), StorageError> {
+        credentials::update(self, credential).await
+    }
+
+    async fn delete_credential(&self, id: &str) -> Result<(), StorageError> {
+        credentials::delete(self, id).await
+    }
+
+    async fn list_credentials_due_for_refresh(
+        &self,
+        threshold: std::time::Duration,
+    ) -> Result<Vec<x_types::credential::CredentialDef>, StorageError> {
+        credentials::list_due_for_refresh(self, threshold).await
+    }
+
+    async fn create_api_key(
+        &self,
+        key: &x_types::api_key::ApiKeyRecord,
+    ) -> Result<(), StorageError> {
+        api_keys::create(self, key).await
+    }
+
+    async fn lookup_api_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<x_types::api_key::ApiKeyRecord>, StorageError> {
+        api_keys::lookup_by_hash(self, key_hash).await
+    }
+
+    async fn list_api_keys(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<x_types::api_key::ApiKeyRecord>, StorageError> {
+        api_keys::list(self, tenant_id).await
+    }
+
+    async fn revoke_api_key(&self, id: &str) -> Result<bool, StorageError> {
+        api_keys::revoke(self, id).await
+    }
+
+    async fn touch_api_key(
+        &self,
+        id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        api_keys::touch(self, id, at).await
+    }
+
+    async fn register_node(
+        &self,
+        node: &x_types::cluster::ClusterNode,
+    ) -> Result<(), StorageError> {
+        cluster::register(self, node).await
+    }
+
+    async fn heartbeat_node(&self, node_id: Uuid) -> Result<(), StorageError> {
+        cluster::heartbeat(self, node_id).await
+    }
+
+    async fn drain_node(&self, node_id: Uuid) -> Result<(), StorageError> {
+        cluster::drain(self, node_id).await
+    }
+
+    async fn deregister_node(&self, node_id: Uuid) -> Result<(), StorageError> {
+        cluster::deregister(self, node_id).await
+    }
+
+    async fn list_nodes(&self) -> Result<Vec<x_types::cluster::ClusterNode>, StorageError> {
+        cluster::list(self).await
+    }
+
+    async fn should_drain(&self, node_id: Uuid) -> Result<bool, StorageError> {
+        cluster::should_drain(self, node_id).await
+    }
+
+    async fn reap_stale_nodes(
+        &self,
+        stale_threshold: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        cluster::reap_stale(self, stale_threshold).await
+    }
+
+    async fn upsert_circuit_breaker(
+        &self,
+        state: &x_types::circuit_breaker::CircuitBreakerState,
+    ) -> Result<(), StorageError> {
+        circuit_breakers::upsert(self, state).await
+    }
+
+    async fn list_open_circuit_breakers(
+        &self,
+    ) -> Result<Vec<x_types::circuit_breaker::CircuitBreakerState>, StorageError> {
+        circuit_breakers::list_open(self).await
+    }
+
+    async fn delete_circuit_breaker(
+        &self,
+        tenant_id: &TenantId,
+        handler: &str,
+    ) -> Result<(), StorageError> {
+        circuit_breakers::delete(self, tenant_id, handler).await
+    }
+
+    async fn append_audit_log(
+        &self,
+        entry: &x_types::audit::AuditLogEntry,
+    ) -> Result<(), StorageError> {
+        audit::append(self, entry).await
+    }
+
+    async fn list_audit_log(
+        &self,
+        instance_id: InstanceId,
+        limit: u32,
+    ) -> Result<Vec<x_types::audit::AuditLogEntry>, StorageError> {
+        audit::list_by_instance(self, instance_id, limit).await
+    }
+
+    async fn list_audit_log_by_tenant(
+        &self,
+        tenant_id: &TenantId,
+        limit: u32,
+    ) -> Result<Vec<x_types::audit::AuditLogEntry>, StorageError> {
+        audit::list_by_tenant(self, tenant_id, limit).await
+    }
+
+    async fn create_rollback_policy(
+        &self,
+        tenant_id: &str,
+        sequence_name: &str,
+        error_rate_threshold: f64,
+        time_window_secs: i32,
+        cooldown_secs: Option<i32>,
+        confirmation_window_secs: Option<i32>,
+        webhook_url: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r"INSERT INTO rollback_policies (tenant_id, sequence_name, error_rate_threshold, time_window_secs, cooldown_secs, confirmation_window_secs, webhook_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (tenant_id, sequence_name) DO UPDATE SET
+               error_rate_threshold = EXCLUDED.error_rate_threshold,
+               time_window_secs = EXCLUDED.time_window_secs,
+               cooldown_secs = EXCLUDED.cooldown_secs,
+               confirmation_window_secs = EXCLUDED.confirmation_window_secs,
+               webhook_url = EXCLUDED.webhook_url,
+               enabled = 1,
+               updated_at = NOW()"
+        )
+        .bind(tenant_id)
+        .bind(sequence_name)
+        .bind(error_rate_threshold)
+        .bind(time_window_secs)
+        .bind(cooldown_secs.unwrap_or(3600))
+        .bind(confirmation_window_secs.unwrap_or(60))
+        .bind(webhook_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_rollback_policy(
+        &self,
+        tenant_id: &str,
+        sequence_name: &str,
+    ) -> Result<Option<x_types::rollback::RollbackPolicy>, StorageError> {
+        let row: Option<(i64, String, String, f64, i32, bool, i32, i32, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT id, tenant_id, sequence_name, error_rate_threshold, time_window_secs, enabled, COALESCE(cooldown_secs, 3600), COALESCE(confirmation_window_secs, 60), webhook_url, created_at, updated_at FROM rollback_policies WHERE tenant_id = $1 AND sequence_name = $2"
+        )
+        .bind(tenant_id)
+        .bind(sequence_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(
+                id,
+                tenant_id,
+                sequence_name,
+                error_rate_threshold,
+                time_window_secs,
+                enabled,
+                cooldown_secs,
+                confirmation_window_secs,
+                webhook_url,
+                created_at,
+                updated_at,
+            )| {
+                x_types::rollback::RollbackPolicy {
+                    id,
+                    tenant_id,
+                    sequence_name,
+                    error_rate_threshold,
+                    time_window_secs,
+                    enabled,
+                    cooldown_secs,
+                    confirmation_window_secs,
+                    webhook_url,
+                    created_at,
+                    updated_at,
+                }
+            },
+        ))
+    }
+
+    async fn list_rollback_policies(
+        &self,
+        tenant_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<x_types::rollback::RollbackPolicy>, StorageError> {
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            f64,
+            i32,
+            bool,
+            i32,
+            i32,
+            Option<String>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        )> = if let Some(t) = tenant_id {
+            sqlx::query_as(
+                "SELECT id, tenant_id, sequence_name, error_rate_threshold, time_window_secs, enabled, COALESCE(cooldown_secs, 3600), COALESCE(confirmation_window_secs, 60), webhook_url, created_at, updated_at FROM rollback_policies WHERE tenant_id = $1 LIMIT $2"
+            )
+            .bind(t)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, tenant_id, sequence_name, error_rate_threshold, time_window_secs, enabled, COALESCE(cooldown_secs, 3600), COALESCE(confirmation_window_secs, 60), webhook_url, created_at, updated_at FROM rollback_policies LIMIT $1"
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    tenant_id,
+                    sequence_name,
+                    error_rate_threshold,
+                    time_window_secs,
+                    enabled,
+                    cooldown_secs,
+                    confirmation_window_secs,
+                    webhook_url,
+                    created_at,
+                    updated_at,
+                )| {
+                    x_types::rollback::RollbackPolicy {
+                        id,
+                        tenant_id,
+                        sequence_name,
+                        error_rate_threshold,
+                        time_window_secs,
+                        enabled,
+                        cooldown_secs,
+                        confirmation_window_secs,
+                        webhook_url,
+                        created_at,
+                        updated_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn delete_rollback_policy(
+        &self,
+        tenant_id: &str,
+        sequence_name: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM rollback_policies WHERE tenant_id = $1 AND sequence_name = $2")
+            .bind(tenant_id)
+            .bind(sequence_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_rollback(
+        &self,
+        tenant_id: &str,
+        sequence_name: &str,
+        error_rate: f64,
+        threshold: f64,
+        reason: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO rollback_history (tenant_id, sequence_name, error_rate, threshold, reason) VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(tenant_id)
+        .bind(sequence_name)
+        .bind(error_rate)
+        .bind(threshold)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_error_rate(
+        &self,
+        tenant_id: &str,
+        sequence_name: &str,
+        window_secs: i64,
+    ) -> Result<Option<f64>, StorageError> {
+        let start = Utc::now() - chrono::Duration::seconds(window_secs);
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            r"SELECT
+               COUNT(*) FILTER (WHERE event_type = 'InstanceFailed') as failed,
+               COUNT(*) as total
+             FROM telemetry_mobile_events
+             WHERE tenant_id = $1
+               AND payload->>'sequence_name' = $2
+               AND created_at >= $3",
+        )
+        .bind(tenant_id)
+        .bind(sequence_name)
+        .bind(start)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(failed, total)| {
+            if total > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                Some(failed as f64 / total as f64)
+            } else {
+                None
+            }
+        }))
+    }
+
+    async fn list_rollback_history(
+        &self,
+        tenant_id: Option<&str>,
+        sequence_name: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<x_types::rollback::RollbackHistory>, StorageError> {
+        use std::fmt::Write;
+        let mut query = String::from(
+            "SELECT id, tenant_id, sequence_name, triggered_at, error_rate, threshold, previous_manifest_version, reason, alert_sent FROM rollback_history WHERE 1=1"
+        );
+        let mut param_idx = 1u32;
+        if tenant_id.is_some() {
+            write!(query, " AND tenant_id = ${param_idx}").unwrap();
+            param_idx += 1;
+        }
+        if sequence_name.is_some() {
+            write!(query, " AND sequence_name = ${param_idx}").unwrap();
+            param_idx += 1;
+        }
+        write!(query, " ORDER BY triggered_at DESC LIMIT ${param_idx}").unwrap();
+
+        let mut q = sqlx::query_as(&query);
+        if let Some(t) = tenant_id {
+            q = q.bind(t);
+        }
+        if let Some(s) = sequence_name {
+            q = q.bind(s);
+        }
+        q = q.bind(i64::from(limit));
+
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            DateTime<Utc>,
+            f64,
+            f64,
+            Option<String>,
+            String,
+            bool,
+        )> = q.fetch_all(&self.pool).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    tenant_id,
+                    sequence_name,
+                    triggered_at,
+                    error_rate,
+                    threshold,
+                    previous_manifest_version,
+                    reason,
+                    alert_sent,
+                )| {
+                    x_types::rollback::RollbackHistory {
+                        id,
+                        tenant_id,
+                        sequence_name,
+                        triggered_at,
+                        error_rate,
+                        threshold,
+                        previous_manifest_version,
+                        reason,
+                        alert_sent,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn ping(&self) -> Result<(), StorageError> {
+        misc::ping(self).await
+    }
+}
+
+// ============================================================================
+// Sub-trait 9: TelemetryStore
+// ============================================================================
+
+#[async_trait]
+impl crate::TelemetryStore for PostgresStorage {
+    async fn ingest_telemetry_event(
+        &self,
+        event_type: &str,
+        payload: &str,
+        device_id: &str,
+        os_name: &str,
+        os_version: &str,
+        app_version: &str,
+        sdk_version: &str,
+        tenant_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r"INSERT INTO telemetry_mobile_events
+               (event_type, payload, device_id, os_name, os_version, app_version, sdk_version, tenant_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ",
+        )
+        .bind(event_type)
+        .bind(payload)
+        .bind(device_id)
+        .bind(os_name)
+        .bind(os_version)
+        .bind(app_version)
+        .bind(sdk_version)
+        .bind(tenant_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_usage_event(&self, event: &crate::UsageEvent) -> Result<(), StorageError> {
+        sqlx::query(
+            r"INSERT INTO usage_events
+               (tenant_id, instance_id, block_id, kind, model, input_tokens, output_tokens, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&event.tenant_id)
+        .bind(event.instance_id.map(x_types::ids::InstanceId::into_uuid))
+        .bind(&event.block_id)
+        .bind(&event.kind)
+        .bind(&event.model)
+        .bind(event.input_tokens)
+        .bind(event.output_tokens)
+        .bind(event.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_usage(
+        &self,
+        tenant_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<crate::UsageAggregate>, StorageError> {
+        use sqlx::Row;
+        // SUM(bigint) is NUMERIC in Postgres — cast back to BIGINT for i64 decode.
+        let rows = sqlx::query(
+            r"SELECT kind, model,
+                     COUNT(*)::BIGINT AS events,
+                     COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens,
+                     COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens
+              FROM usage_events
+              WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
+              GROUP BY kind, model ORDER BY kind, model",
+        )
+        .bind(tenant_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::UsageAggregate {
+                kind: r.get("kind"),
+                model: r.get("model"),
+                events: r.get("events"),
+                input_tokens: r.get("input_tokens"),
+                output_tokens: r.get("output_tokens"),
+            })
+            .collect())
+    }
+
+    async fn ingest_telemetry_events_batch(
+        &self,
+        events: &[crate::TelemetryEvent],
+    ) -> Result<u64, StorageError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        // Postgres limit: 65535 params. 9 params per row -> batch <= ~7000.
+        for chunk in events.chunks(7000) {
+            let mut qb: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO telemetry_mobile_events (event_type, payload, device_id, os_name, os_version, app_version, sdk_version, tenant_id, created_at) ",
+            );
+            qb.push_values(chunk, |mut b, event| {
+                b.push_bind(&event.event_type);
+                b.push_bind(&event.payload);
+                b.push_bind(&event.device_id);
+                b.push_bind(&event.os_name);
+                b.push_bind(&event.os_version);
+                b.push_bind(&event.app_version);
+                b.push_bind(&event.sdk_version);
+                b.push_bind(&event.tenant_id);
+                b.push_bind(event.created_at);
+            });
+            let result = qb.build().execute(&self.pool).await?;
+            total += result.rows_affected();
+        }
+        Ok(total)
+    }
+
+    async fn ingest_telemetry_error(
+        &self,
+        error_type: &str,
+        message: &str,
+        stack_trace: Option<&str>,
+        device_id: &str,
+        os_name: &str,
+        os_version: &str,
+        app_version: &str,
+        sdk_version: &str,
+        tenant_id: &str,
+        instance_id: Option<&str>,
+        sequence_name: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r"INSERT INTO telemetry_mobile_errors
+               (error_type, message, stack_trace, device_id, os_name, os_version, app_version, sdk_version, tenant_id, instance_id, sequence_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ",
+        )
+        .bind(error_type)
+        .bind(message)
+        .bind(stack_trace)
+        .bind(device_id)
+        .bind(os_name)
+        .bind(os_version)
+        .bind(app_version)
+        .bind(sdk_version)
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(sequence_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_telemetry_dashboard(
+        &self,
+        query_type: &str,
+        tenant_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let rows: Vec<(String, i64)> = match query_type {
+            "sync_completed_versions" => {
+                sqlx::query_as(
+                    r"SELECT COALESCE(payload->>'version', 'unknown') as version, COUNT(*) as cnt
+                       FROM telemetry_mobile_events
+                       WHERE event_type = 'SyncCompleted'
+                         AND tenant_id = $1
+                         AND received_at BETWEEN $2 AND $3
+                       GROUP BY payload->>'version'
+                       ORDER BY cnt DESC
+                       LIMIT 50",
+                )
+                .bind(tenant_id)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            "error_rate_per_sequence" => {
+                sqlx::query_as(
+                    r"SELECT COALESCE(sequence_name, 'unknown') as name, COUNT(*) as cnt
+                       FROM telemetry_mobile_errors
+                       WHERE tenant_id = $1
+                         AND received_at BETWEEN $2 AND $3
+                       GROUP BY sequence_name
+                       ORDER BY cnt DESC
+                       LIMIT 50",
+                )
+                .bind(tenant_id)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            "top_failing_steps" => sqlx::query_as(
+                r"SELECT COALESCE(payload->>'step_name', 'unknown') as step_name, COUNT(*) as cnt
+                       FROM telemetry_mobile_events
+                       WHERE event_type = 'InstanceFailed'
+                         AND tenant_id = $1
+                         AND received_at BETWEEN $2 AND $3
+                       GROUP BY payload->>'step_name'
+                       ORDER BY cnt DESC
+                       LIMIT 50",
+            )
+            .bind(tenant_id)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await?,
+            "device_os_breakdown" => {
+                sqlx::query_as(
+                    r"SELECT COALESCE(os_name, 'unknown') as os_name, COUNT(*) as cnt
+                       FROM telemetry_mobile_events
+                       WHERE tenant_id = $1
+                         AND received_at BETWEEN $2 AND $3
+                       GROUP BY os_name
+                       ORDER BY cnt DESC
+                       LIMIT 50",
+                )
+                .bind(tenant_id)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            _ => Vec::new(),
+        };
+        Ok(rows)
+    }
+
+    async fn delete_old_telemetry_events(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StorageError> {
+        let result = sqlx::query(
+            "DELETE FROM telemetry_mobile_events WHERE id IN (
+                SELECT id FROM telemetry_mobile_events WHERE received_at < $1 LIMIT $2
+            )",
+        )
+        .bind(older_than)
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+// ============================================================================
+// Sub-trait 10: ResourceStore
+// ============================================================================
+
+#[async_trait]
+impl crate::ResourceStore for PostgresStorage {
+    fn artifacts_enabled(&self) -> bool {
+        self.artifact_store.is_some()
+    }
+
+    async fn put_artifact(
+        &self,
+        instance_id: InstanceId,
+        content_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<x_types::artifact::ArtifactRef, StorageError> {
+        crate::artifacts::require_store(self.artifact_store.as_ref())?
+            .put(&instance_id.to_string(), content_type, bytes)
+            .await
+    }
+
+    async fn get_artifact(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        crate::artifacts::require_store(self.artifact_store.as_ref())?
+            .get(key)
+            .await
+    }
+
+    async fn delete_artifact(&self, key: &str) -> Result<(), StorageError> {
+        crate::artifacts::require_store(self.artifact_store.as_ref())?
+            .delete(key)
+            .await
+    }
+
+    async fn list_artifacts(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<x_types::artifact::ArtifactMeta>, StorageError> {
+        crate::artifacts::require_store(self.artifact_store.as_ref())?
+            .list(&instance_id.to_string())
+            .await
+    }
+
+    async fn list_artifact_gc_candidates(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: u32,
+    ) -> Result<Vec<InstanceId>, StorageError> {
+        instances::list_artifact_gc_candidates(self, cutoff, limit).await
+    }
+
+    async fn mark_artifacts_gced(&self, instance_id: InstanceId) -> Result<(), StorageError> {
+        instances::mark_artifacts_gced(self, instance_id).await
+    }
+
+    async fn set_instance_kv(
+        &self,
+        instance_id: InstanceId,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        self.set_instance_kv_impl(instance_id, key, value).await
+    }
+
+    async fn get_instance_kv(
+        &self,
+        instance_id: InstanceId,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        self.get_instance_kv_impl(instance_id, key).await
+    }
+
+    async fn get_all_instance_kv(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, StorageError> {
+        self.get_all_instance_kv_impl(instance_id).await
+    }
+
+    async fn delete_instance_kv(
+        &self,
+        instance_id: InstanceId,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        self.delete_instance_kv_impl(instance_id, key).await
+    }
+
+    async fn save_externalized_state(
+        &self,
+        instance_id: InstanceId,
+        ref_key: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        externalized::save(self, instance_id, ref_key, payload).await
+    }
+
+    async fn batch_save_externalized_state(
+        &self,
+        instance_id: InstanceId,
+        entries: &[(String, serde_json::Value)],
+    ) -> Result<(), StorageError> {
+        externalized::batch_save(self, instance_id, entries).await
+    }
+
+    async fn get_externalized_state(
+        &self,
+        ref_key: &str,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        externalized::get(self, ref_key).await
+    }
+
+    async fn batch_get_externalized_state(
+        &self,
+        ref_keys: &[String],
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, StorageError> {
+        externalized::batch_get(self, ref_keys).await
+    }
+
+    async fn delete_externalized_state(&self, ref_key: &str) -> Result<(), StorageError> {
+        externalized::delete(self, ref_key).await
+    }
+
+    async fn delete_expired_externalized_state(&self, limit: u32) -> Result<u64, StorageError> {
+        externalized::delete_expired(self, limit).await
+    }
+
+    async fn create_resource_pool(
+        &self,
+        pool: &x_types::pool::ResourcePool,
+    ) -> Result<(), StorageError> {
+        pools::create(self, pool).await
+    }
+
+    async fn get_resource_pool(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<x_types::pool::ResourcePool>, StorageError> {
+        pools::get(self, id).await
+    }
+
+    async fn list_resource_pools(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<x_types::pool::ResourcePool>, StorageError> {
+        pools::list(self, tenant_id).await
+    }
+
+    async fn update_pool_round_robin_index(
+        &self,
+        pool_id: uuid::Uuid,
+        index: u32,
+    ) -> Result<(), StorageError> {
+        pools::update_round_robin(self, pool_id, index).await
+    }
+
+    async fn delete_resource_pool(&self, id: uuid::Uuid) -> Result<(), StorageError> {
+        pools::delete(self, id).await
+    }
+
+    async fn add_pool_resource(
+        &self,
+        resource: &x_types::pool::PoolResource,
+    ) -> Result<(), StorageError> {
+        pools::add_resource(self, resource).await
+    }
+
+    async fn list_pool_resources(
+        &self,
+        pool_id: uuid::Uuid,
+    ) -> Result<Vec<x_types::pool::PoolResource>, StorageError> {
+        pools::list_resources(self, pool_id).await
+    }
+
+    async fn update_pool_resource(
+        &self,
+        resource: &x_types::pool::PoolResource,
+    ) -> Result<(), StorageError> {
+        pools::update_resource(self, resource).await
+    }
+
+    async fn delete_pool_resource(&self, id: uuid::Uuid) -> Result<(), StorageError> {
+        pools::delete_resource(self, id).await
+    }
+
+    async fn increment_resource_usage(
+        &self,
+        resource_id: uuid::Uuid,
+        today: chrono::NaiveDate,
+    ) -> Result<(), StorageError> {
+        pools::increment_usage(self, resource_id, today).await
+    }
+
+    async fn save_checkpoint(
+        &self,
+        checkpoint: &x_types::checkpoint::Checkpoint,
+    ) -> Result<(), StorageError> {
+        checkpoints::save(self, checkpoint).await
+    }
+
+    async fn get_latest_checkpoint(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Option<x_types::checkpoint::Checkpoint>, StorageError> {
+        checkpoints::get_latest(self, instance_id).await
+    }
+
+    async fn list_checkpoints(
+        &self,
+        instance_id: InstanceId,
+        limit: u32,
+    ) -> Result<Vec<x_types::checkpoint::Checkpoint>, StorageError> {
+        checkpoints::list(self, instance_id, limit).await
+    }
+
+    async fn prune_checkpoints(
+        &self,
+        instance_id: InstanceId,
+        keep: u32,
+    ) -> Result<u64, StorageError> {
+        checkpoints::prune(self, instance_id, keep).await
+    }
+}
+

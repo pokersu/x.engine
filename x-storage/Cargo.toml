@@ -1,0 +1,21 @@
+[package]
+name = "x-storage"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+x-types = { path = "../x-types" }
+sqlx.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio.workspace = true

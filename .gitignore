@@ -1,0 +1,28 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Database files (local dev)
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# CodeGraph (local index data)
+.codegraph/
