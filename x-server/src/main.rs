@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use x_engine::handlers::HandlerRegistry;
 
 #[tokio::main]
@@ -11,6 +12,16 @@ async fn main() -> anyhow::Result<()> {
     let storage: Arc<dyn x_storage::StorageBackend> = Arc::new(
         x_storage::sqlite::SqliteStorage::file("./x.engine.db").await?,
     );
+
+    // Set up the Prometheus metrics recorder.
+    let prometheus_handle = {
+        let recorder = PrometheusBuilder::new()
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::set_global_recorder(Box::new(recorder))
+            .map_err(|e| anyhow::anyhow!("failed to set metrics recorder: {e}"))?;
+        handle
+    };
 
     let mut handlers = HandlerRegistry::new();
     x_engine::handlers::builtin::register_builtins(&mut handlers);
@@ -31,7 +42,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app_state = x_api::AppState::new(Arc::clone(&storage), cancel.clone());
+    let app_state = x_api::AppState::new(
+        Arc::clone(&storage),
+        cancel.clone(),
+        Some(prometheus_handle),
+    );
     let app = x_api::build_router(app_state);
     let app = app.layer(tower_http::cors::CorsLayer::permissive());
     let app = app.layer(tower_http::trace::TraceLayer::new_for_http());

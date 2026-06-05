@@ -189,3 +189,75 @@ find x-types x-storage x-engine x-api x-server -name '*.rs' -exec sed -i '' 's/o
 1. **HTTP handler 加强**: 当前保留 `reqwest` 依赖和 HTTP 相关 handler，可直接用于 API 编排
 2. **专属 API 编排 Block**: 可增加 `HttpRequest`、`GraphQLQuery`、`GRpcCall` 等专用 block type
 3. **主从节点分离**: 当前 engine + api 在同一进程，后续可分离
+
+---
+
+## API 端点一览
+
+所有端点注册在 `x-api/src/lib.rs` 的 `build_router` 中。核心 API（Sequences + Instances）同时挂载在 `/api/v1/...` 和 `/...` 两个路径下；系统类端点（health/metrics/webhooks）仅挂载在根路径 `/...`。
+
+### Sequences（`x-api/src/sequences.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/sequences` | 创建序列 |
+| `GET` | `/api/v1/sequences` | 列出序列 |
+| `GET` | `/api/v1/sequences/{id}` | 获取序列详情 |
+| `DELETE` | `/api/v1/sequences/{id}` | 删除序列 |
+| `POST` | `/api/v1/sequences/{id}/deprecate` | 标记序列为废弃 |
+| `POST` | `/api/v1/sequences/{id}/status` | 设置序列状态 |
+| `GET` | `/api/v1/sequences/by-name` | 按 `(namespace, name, version)` 查询 |
+| `GET` | `/api/v1/sequences/versions` | 列出序列版本列表 |
+
+> **注意**: `/sequences/by-name` 和 `/sequences/versions` 的路由注册在 `{id}` 通配符之后，axum 会先匹配 `{id}` 导致这两个端点无法命中。需要调整注册顺序修复。
+
+### Instances（`x-api/src/instances/mod.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/instances` | 创建实例（触发执行） |
+| `POST` | `/api/v1/instances/batch` | 批量创建实例 |
+| `GET` | `/api/v1/instances` | 列出实例 |
+| `GET` | `/api/v1/instances/{id}` | 获取实例详情 |
+| `PATCH` | `/api/v1/instances/{id}/state` | 更新实例状态 |
+| `PATCH` | `/api/v1/instances/{id}/context` | 更新实例上下文 |
+| `POST` | `/api/v1/instances/{id}/retry` | 重试失败的实例 |
+| `POST` | `/api/v1/instances/{id}/signals` | 发送信号（cancel/pause/resume/审批等） |
+| `GET` | `/api/v1/instances/{id}/outputs` | 获取步骤输出 |
+| `GET` | `/api/v1/instances/{id}/tree` | 获取执行树 |
+
+### 流式输出（`x-api/src/streaming.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/instances/{id}/stream` | SSE 实时推送实例进度（state/output/done 事件） |
+
+仅挂载在根路径。查询参数 `?poll_ms=500`（100~5000ms）控制轮询间隔。默认 500ms，keepalive 15s。并发限制 256，超限返回 503。
+
+### 健康检查（`x-api/src/health.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/health/live` | Liveness 探针，进程存活即返回 200 |
+| `GET` | `/health/ready` | Readiness 探针，数据库可达返回 200，不可达返回 503 |
+
+### 指标（`x-api/src/metrics.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/metrics` | Prometheus 指标端点（text/plain） |
+
+仅在 `AppState.prometheus_handle` 存在时挂载（由 `x-server/src/main.rs` 初始化时传入）。
+
+### Webhook 接收（`x-api/src/webhooks.rs`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/webhooks/events/{slug}` | 接收外部 Webhook 请求，创建一个新的 TaskInstance |
+
+当前为 stub 实现：`sequence_id` 硬编码为随机 UUID，未实现 slug → sequence 的映射。需要配合 `triggers` 表注册才能正常工作。
+
+### 架构要点
+
+- `x-api/src/lib.rs` 中的 `AppState` 包含：`storage`（存储后端）、`shutdown`（CancellationToken）、`max_context_bytes`（默认 256KB）、`stream_limiter`（Semaphore，控制 SSE 并发）、`prometheus_handle`（可选的 Prometheus 句柄）
+- `build_router()` 组装路由：先组装 `api_routes()`（sequences + instances + streaming），然后 nest 到 `/api/v1` 并 merge 到根路径；再 merge `health`、`webhooks`；条件挂载 `metrics`

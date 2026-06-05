@@ -2,22 +2,23 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use metrics_exporter_prometheus::PrometheusHandle;
 
-/// Metrics-specific state (separate from `AppState` to avoid circular deps).
-#[derive(Clone)]
-pub struct MetricsState {
-    pub handle: PrometheusHandle,
-}
+use crate::error::ApiError;
+use crate::AppState;
 
-pub fn routes() -> Router<MetricsState> {
+pub fn routes() -> Router<AppState> {
     Router::new().route("/metrics", get(prometheus_metrics))
 }
 
-async fn prometheus_metrics(State(state): State<MetricsState>) -> impl IntoResponse {
-    let output = state.handle.render();
-    (
+async fn prometheus_metrics(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let handle = state
+        .prometheus_handle
+        .ok_or_else(|| ApiError::Unavailable("metrics not enabled".into()))?;
+    let output = handle.render();
+    Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
-    )
+    ))
 }

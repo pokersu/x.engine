@@ -34,3 +34,8 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 tempfile = "3"
 http = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "engine_bench"
+harness = false

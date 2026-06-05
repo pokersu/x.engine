@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::get;
+use axum::Router;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -31,6 +33,11 @@ pub(crate) struct StreamQuery {
 
 const fn default_poll_ms() -> u64 {
     500
+}
+
+/// Register streaming routes.
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/instances/{id}/stream", get(stream_instance))
 }
 
 const fn is_terminal(state: InstanceState) -> bool {

@@ -5,11 +5,13 @@ pub mod metrics;
 pub mod request_id;
 pub mod sequences;
 pub mod streaming;
+pub mod test_harness;
 pub mod webhooks;
 
 use std::sync::Arc;
 
 use axum::Router;
+use metrics_exporter_prometheus::PrometheusHandle;
 use x_storage::StorageBackend;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -41,15 +43,22 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     pub max_context_bytes: u32,
     pub stream_limiter: Arc<Semaphore>,
+    /// Prometheus metrics handle. `None` if metrics are not enabled.
+    pub prometheus_handle: Option<PrometheusHandle>,
 }
 
 impl AppState {
-    pub fn new(storage: Arc<dyn StorageBackend>, cancel: CancellationToken) -> Self {
+    pub fn new(
+        storage: Arc<dyn StorageBackend>,
+        cancel: CancellationToken,
+        prometheus_handle: Option<PrometheusHandle>,
+    ) -> Self {
         Self {
             storage,
             shutdown: cancel,
             max_context_bytes: 256 * 1024,
             stream_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
+            prometheus_handle,
         }
     }
 }
@@ -59,14 +68,23 @@ fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(sequences::routes())
         .merge(instances::routes())
+        .merge(streaming::routes())
 }
 
 /// Build the axum router with all routes.
 pub fn build_router(state: AppState) -> Router {
-    let mut api = api_routes();
+    let api = api_routes();
 
-    Router::new()
+    let mut root = Router::new()
         .nest(API_V1_PREFIX, api.clone())
         .merge(api)
-        .with_state(state)
+        .merge(health::routes())
+        .merge(webhooks::public_routes());
+
+    // Only mount /metrics when Prometheus is configured.
+    if state.prometheus_handle.is_some() {
+        root = root.merge(metrics::routes());
+    }
+
+    root.with_state(state)
 }

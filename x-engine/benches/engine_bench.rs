@@ -561,7 +561,6 @@ fn bench_scheduler_tick(c: &mut Criterion) {
                     cron_tick_secs: 60,
                     shutdown_grace_period_secs: 10,
                     max_context_bytes: 0,
-                    externalization_mode: x_types::config::ExternalizationMode::Never,
                     externalize_output_threshold: 0,
                     ..x_types::config::SchedulerConfig::default()
                 };
@@ -616,7 +615,6 @@ fn bench_tick_once(c: &mut Criterion) {
                         cron_tick_secs: 60,
                         shutdown_grace_period_secs: 10,
                         max_context_bytes: 0,
-                        externalization_mode: x_types::config::ExternalizationMode::Never,
                         externalize_output_threshold: 0,
                         ..x_types::config::SchedulerConfig::default()
                     };
