@@ -601,102 +601,168 @@ pub const DEFAULT_MAX_CONTEXT_BYTES: u32 = 256 * 1024;  // 256 KiB
 - 每个 tick 的 `preload_externalized_markers()` 使用 `batch_get_externalized_state` 一次批量回填所有 marker
 - Block output 侧的 externalization 通过 `maybe_externalize()` 处理（`x-engine/src/handlers/step.rs:372-412`）
 - `max_context_bytes: 0` 可关闭大小检查，但大字段仍会在每 tick 传输
+- **artifact store**（`x-storage/src/artifacts.rs`）已支持 memory / local FS / S3 三种后端，但只用于 handler 显式调用（`blob_put`/`tool_call`），未接入 context 系统
 
-### 解决方案选型
+### 统一方案：自动对象存储 Offload + Lazy Load
 
-| 方案 | 说明 | 实现成本 | 对大变量的支持 | DB 压力 |
-|---|---|---|---|---|
-| **A: 启用外部化** | 设置 `externalize_output_threshold: 1024` + `max_context_bytes: 0`，让引擎自动外部化大字段 | ✅ 配置一行 | 🟡 可存，但每 tick 仍传输 | 🟡 中等 |
-| **B: 存引用** | context 只存文件引用（bucket/key/size），需要时通过 handler 读取 | 🟡 写一个 handler | ✅ 完美隔离 | 🟢 低 |
-| **C: 懒加载** | 增强 preload 机制：只有 handler 真正访问时才从 externalized_state 读取 | 🔴 较大改动 | ✅ 最优 | 🟢 低 |
+#### 设计思路
 
-#### 方案 A：启用外部化（零代码改动）
+将现有的 `externalized_state` 表替换为 **artifact store（对象存储）**，读取从每 tick eager load 改为**访问时 lazy load + 内存缓存**：
 
-```rust
-SchedulerConfig {
-    externalize_output_threshold: 1024,  // 1KB 以上字段自动外部化
-    max_context_bytes: 0,                // 0 = 关闭大小检查
-    ..
-}
+```
+写入（自动，基于阈值）：
+
+  handler 写入 context.data.ocr_result = <5MB>
+    │
+    ▼
+  检查 > threshold（默认 64KB）？
+    │
+    ├── 否 → 正常写入 task_instances.context（与现在一样）
+    │
+    └── 是 → 自动执行：
+              1. put_artifact("inst_xxx/ctx/ocr_result", <5MB>)
+              2. context 中替换为 {"$ref": "inst_xxx/ctx/ocr_result"}
+              3. 写入 DB（仅 ~60 字节）
+
+读取（lazy + 缓存）：
+
+  handler / template / expression 访问 context.data.ocr_result
+    │
+    ▼
+  检查值是 $ref 标记？
+    │
+    ├── 否 → 直接返回（普通字段）
+    │
+    └── 是 → 1. 查内存缓存（moka LRU）
+              2. 缓存 miss → 从 artifact store 读取
+              3. 缓存后返回
+              4. 下一 tick 访问同样字段 → 缓存 hit，0 DB/存储开销
 ```
 
-**注意**：block output 的外部化已支持（`step.rs:maybe_externalize`），context.data 的外部化也完整。但即使外部化，每 tick 仍会 eager load 所有字段回内存。
+#### 为什么结合对象存储 + 懒加载
 
-#### 方案 B：存引用（推荐）
+| 维度 | 纯 externalized_state + lazy | 对象存储 offload + lazy |
+|------|------|------|
+| 大字段是否经过 DB | ✅ **仍然经过** — `externalized_state` 表在同一 DB | ❌ **完全不经过** — 对象存储独立 |
+| DB 连接池压力 | 🟡 有 — 大字段查询仍占用连接 | 🟢 **无** |
+| DB 备份大小 | 🟡 包含大字段 | 🟢 仅 metadata |
+| 跨节点共享 | ✅ 天然（共享 DB） | ✅ 天然（共享 S3） |
+| 延迟 | 🟢 低（同 DB，~1-5ms） | 🟡 首次 ~50-100ms（S3），缓存后消除 |
+| 运维 | 🟢 无需额外配置 | 🟡 需配置 artifact store 后端 |
 
-不在 context 中存大 JSON，而是存一个轻量引用：
+如果没有对象存储（只用 SQLite 开发），可退化到 memory 或 local FS backend，功能不变。
+
+#### Marker 形状
+
+复用已有的 ArtifactRef 形状，保持与 blob_put/tool_call 输出一致：
 
 ```json
 {
-  "ocr_file": {
-    "bucket": "my-bucket",
-    "key": "ocr/inst_abc123.json",
-    "size_bytes": 5242880
-  }
+  "$ref": "inst_xxx/ctx/ocr_result",
+  "content_type": "application/json",
+  "size": 5242880
 }
 ```
 
-需要时通过 handler 按需读取：
+或简化版（最小 payload）：
 
 ```json
-{
-  "handler": "http_request",
-  "params": {
-    "method": "GET",
-    "url": "https://storage.example.com/{{context.data.ocr_file.key}}"
-  }
-}
+{"$ref": "inst_xxx/ctx/ocr_result"}
 ```
 
-或自定义 object storage handler 实现 S3/MinIO 读取。
+选择简化版：`ExecutionContext` 中的 marker 只需 key，元信息可从 artifact store 查询。
 
-#### 方案 C：Lazy Load（需要开发）
+#### 实现步骤
 
-修改 `preload_externalized_markers`：
-- 标记哪些字段是 externalized
-- 在模板/表达式解析时，只有真正访问到该字段才去 `externalized_state` 表读取
-- 可以配合 `FieldAccess` 机制（`ContextAccess.data.fields`）预声明需要读取的字段
+##### Step 1：Context 访问拦截层
 
-**关联模块**：
+在 `ExecutionContext` 上加 `$ref` 感知的读取方法，同时在模板引擎和表达式引擎的路径解析入口注入 lazy resolve：
+
+```
+x-types/src/
+├── context.rs       # MOD — 增加 resolve_refs() 批量解释 $ref 标记
+└── artifact.rs      # MOD — 定义 $ref marker 常量
+
+x-engine/src/
+├── preload.rs       # MOD — REMOVE eager load，改为跟踪 mark
+├── template.rs      # MOD — 路径解析时触发 resolve_refs()
+├── expression.rs    # MOD — 同上
+└── handlers/
+    └── param_resolve.rs # MOD — 同上
+```
+
+- 不修改 `ExecutionContext` 的 `Serialize`/`Deserialize`（序列化时保持 `$ref` 不变）
+- 只在**读取路径**上做拦截：模板 `{{context.data.x}}` 和表达式 `context.data.x == 1`
+- `resolve_refs()` 接收一组需要解析的 path，批量读取
+
+##### Step 2：写入时自动 Offload
+
+在 context 写入 DB 的路径上加阈值检查和 offload：
+
 ```
 x-engine/src/
-├── preload.rs          # MOD — 从 eager load 改为 lazy load
-├── template.rs         # MOD — 在路径解析时触发 lazy load
-├── expression.rs       # MOD — 同上
-└── handlers/
-    └── param_resolve.rs # MOD — OutputsSnapshot 同理支持 lazy
+├── handlers/step.rs  # MOD — 保存 block output 时触发 maybe_offload()
+├── preload.rs        # MOD — 写入 context 前触发
+└── config.rs         # MOD — context_offload_threshold 配置
+
+x-types/src/
+└── config.rs         # MOD — OffloadConfig
 ```
 
-### 推荐路线
+- 复用现有的 `externalize_fields()` / `is_marker()` 逻辑，只改存储后端
+- 新 marker 形状 `$ref` 与旧的 `_externalized` 可共存，渐进迁移
 
-1. **短期（本周）**：方案 A + B 结合
-   - 启用 externalization（防止小字段意外膨胀）
-   - 大 JSON 存文件引用，用 `http_request` handler 读取
-   - 如需要 S3/MinIO，实现一个简单的 object storage handler
+##### Step 3：缓存层（消除重复读取）
 
-2. **中期（后续 sprint）**：方案 C
-   - 实现懒加载机制，让 `preload` 真正按需加载
-   - handler 不再需要手动管理引用
+```
+x-engine/src/
+└── context_cache.rs  # NEW — moka LRU 缓存已解析的 $ref 值
+```
+
+```rust
+pub struct ContextCache {
+    cache: moka::sync::Cache<String, Arc<Value>>,
+    max_entries: usize,   // 默认 1000
+    max_bytes_per_value: usize,  // 单值上限，防止缓存撑爆
+}
+```
+
+- 缓存 key = `{instance_id}/{field_path}`（如 `inst_xxx/ctx/ocr_result`）
+- 缓存 TTL = 与 instance 生命周期绑定，instance 完成/失败时失效
+- 跨 tick 命中：大字段只需第一次从对象存储读取，后续 tick 直接走缓存
+
+##### Step 4：GC
+
+复用已有的 artifact GC 机制（`x-engine/src/gc.rs`），无需新增：
+
+- `$ref` 引用的 artifact key 格式为 `{instance_id}/ctx/{field_name}`
+- 现有 sweeper 已能按 `list_artifact_gc_candidates` 清理
 
 ### 相关文件
 
 ```
 x-types/src/
-├── config.rs            # SchedulerConfig.externalize_output_threshold
-└── context.rs           # DEFAULT_MAX_CONTEXT_BYTES / check_size()
+├── config.rs            # MOD — OffloadConfig { threshold, backend }
+├── context.rs           # MOD — resolve_refs() / is_ref()
+└── artifact.rs          # MOD — $REF_PREFIX / REF_KEY 常量
 
 x-storage/src/
-├── externalizing.rs     # externalize_fields() / is_marker() / marker()
-├── postgres/
-│   └── instances.rs     # update_instance_context_externalized()
-└── sqlite/
-    └── instances.rs     # 同上
+├── externalizing.rs     # MOD — maybe_offload() 写入 artifact store
+└── artifacts.rs         #   （已有，无需改动）
 
 x-engine/src/
-├── preload.rs           # preload_externalized_markers() — 批量回填
+├── preload.rs           # MOD — 移除 eager load，改为跟踪 markers
+├── template.rs          # MOD — 路径解析触发 resolve_refs()
+├── expression.rs        # MOD — 同上
+├── context_cache.rs     # NEW — moka LRU 缓存
 ├── handlers/
-│   └── step.rs          # maybe_externalize() — block output 外部化
-└── gc.rs                # externalized_state 清理
+│   └── step.rs          # MOD — maybe_offload 调用
+├── gc.rs                # （已有，无需改动）
+└── config.rs            # MOD — OffloadConfig 加载
+
+x-api/src/
+└── instances/
+    └── lifecycle.rs     # MOD — 创建实例时检查 offload 配置
 ```
 
 ---
@@ -705,17 +771,17 @@ x-engine/src/
 
 | 任务 | 优先级 | 预估工作量 | 说明 |
 |---|---|---|---|
+| **大变量处理（自动对象存储 offload + lazy load + 缓存）** | 🔴 最高 | 4-6 天 | context.data 大字段自动存入 artifact store，访问时 lazy 读取 + 内存缓存，完全不经过 DB |
 | 分布式集成测试 | 🔴 高 | 2-3 天 | 验证核心功能的正确性 |
 | 上下文跨节点可见性测试 | 🔴 高 | 1-2 天 | 与分布式测试合并 |
 | **外部 Worker HTTP API** | 🔴 高 | 2-3 天 | 让外部 Worker 可通过 HTTP 拉取/完成任务 |
 | **HandlerSchema 注册机制（x-ui P1）** | 🔴 高 | 2-3 天 | 在 HandlerRegistry 中增加 schema 字段，LLM 可感知可用节点 |
-| **大变量懒加载（方案 C）** | 🟡 中 | 3-5 天 | context.data 按需读取，避免每 tick eager load |
 | **x-ui 基础框架 + LLM 对话（P2）** | 🟡 中 | 1 周 | x-ui 项目初始化、LLM 对话生成序列 |
 | API Call 节点增强 | 🟡 中 | 3-5 天 | 专用 Block 类型 + 响应处理 |
+| 表达式引擎增强 | 🟡 中 | 3-5 天 | JSON Path / 正则 / 日期函数 |
 | **序列画布 + 手动编辑（x-ui P3）** | 🟡 中 | 2 周 | React Flow 集成、拖拽编辑 |
 | **实时调试 SSE（x-ui P4）** | 🟢 低 | 1.5 周 | x-api 增加 SSE event 端点 + 前端调试浮层 |
 | **OpenAPI 导入（x-ui P5）** | 🟢 低 | 1 周 | 解析 OpenAPI 规范自动注册 handler |
 | **实时 Prompt 调整（x-ui P6）** | 🟢 低 | 2 周 | 运行时修改未执行节点 |
 | Redis 缓存 | 🟢 低 | 5-7 天 | 方案 A（缓存层），性能优化 |
 | Redis 独立后端 | 🟢 低 | 10-15 天 | 方案 B，仅轻量场景 |
-| 表达式引擎增强 | 🟡 中 | 3-5 天 | JSON Path / 正则 / 日期函数 |

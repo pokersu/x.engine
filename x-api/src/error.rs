@@ -58,6 +58,9 @@ impl ApiError {
             StorageError::NotFound { entity: _, id } => Self::NotFound(format!("{entity} {id}")),
             StorageError::Conflict(msg) => Self::Conflict(msg),
             StorageError::TerminalTarget { entity: _, id } => Self::Conflict(format!("{entity} {id} is in a terminal state")),
+            // Connection drops and transient external-backend (object store)
+            // failures are both 503 — retryable, not a server bug.
+            StorageError::Connection(msg) | StorageError::Backend(msg) => Self::Unavailable(msg),
             StorageError::PoolExhausted => Self::Unavailable("connection pool exhausted".into()),
             other => Self::Internal(other.to_string()),
         }
