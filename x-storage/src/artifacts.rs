@@ -125,6 +125,34 @@ impl ObjectArtifactStore {
         format!("{instance_id}/{artifact_id}")
     }
 
+    /// Store `bytes` under a caller-specified key. Unlike [`Self::put`] which
+    /// auto-generates a UUID-based key, this lets the caller control the key
+    /// format (e.g. `"{instance_id}/ctx/{field_name}"` for context offload).
+    ///
+    /// # Errors
+    /// Returns an error if the write to the backend fails, or if `key` is empty.
+    pub async fn put_with_key(
+        &self,
+        key: &str,
+        content_type: &str,
+        bytes: Bytes,
+    ) -> Result<ArtifactRef, StorageError> {
+        let size = bytes.len() as u64;
+        self.store
+            .put(&Path::from(key.to_string()), PutPayload::from_bytes(bytes))
+            .await
+            .map_err(map_err)?;
+        Ok(ArtifactRef {
+            id: key.rsplit('/').next().unwrap_or(key).to_string(),
+            instance_id: key.split('/').next().unwrap_or("").to_string(),
+            key: key.to_string(),
+            content_type: content_type.to_string(),
+            size,
+            uri: format!("artifact://{key}"),
+            created_at: chrono::Utc::now(),
+        })
+    }
+
     /// Store `bytes` and return a durable reference. Takes owned [`Bytes`] so
     /// the buffer reqwest already allocated flows into `object_store` without a
     /// second copy.

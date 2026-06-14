@@ -1531,6 +1531,24 @@ pub trait ResourceStore: Send + Sync + 'static {
         ))
     }
 
+    /// Like [`Self::put_artifact`] but with a caller-specified key rather than
+    /// an auto-generated one. Used by context offload where the key must follow
+    /// the `{instance_uuid}/ctx/{field_name}` convention so the lazy resolver
+    /// can find it.
+    ///
+    /// Default impl delegates to [`Self::put_artifact`] and ignores the key —
+    /// production backends override to use the caller's key verbatim.
+    async fn put_artifact_with_key(
+        &self,
+        _key: &str,
+        _content_type: &str,
+        _bytes: bytes::Bytes,
+    ) -> Result<x_types::artifact::ArtifactRef, StorageError> {
+        Err(StorageError::Unsupported(
+            "artifact storage is not configured".into(),
+        ))
+    }
+
     async fn get_artifact(&self, _key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         Err(StorageError::Unsupported(
             "artifact storage is not configured".into(),

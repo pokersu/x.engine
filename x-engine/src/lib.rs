@@ -6,6 +6,7 @@ pub mod evaluator;
 pub mod expression;
 pub mod externalized;
 pub mod gc;
+pub mod context_cache;
 pub mod handlers;
 pub mod interceptors;
 pub mod lifecycle;

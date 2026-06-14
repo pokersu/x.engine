@@ -1753,6 +1753,17 @@ impl crate::ResourceStore for PostgresStorage {
             .await
     }
 
+    async fn put_artifact_with_key(
+        &self,
+        key: &str,
+        content_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<x_types::artifact::ArtifactRef, StorageError> {
+        crate::artifacts::require_store(self.artifact_store.as_ref())?
+            .put_with_key(key, content_type, bytes)
+            .await
+    }
+
     async fn get_artifact(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         crate::artifacts::require_store(self.artifact_store.as_ref())?
             .get(key)

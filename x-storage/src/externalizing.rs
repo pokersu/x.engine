@@ -6,6 +6,10 @@
 //! (`{"_externalized": true, "_ref": "<key>"}`) and stash the original payload
 //! in `externalized_state`. Readers recognize the marker and re-hydrate.
 //!
+//! Additionally, when the artifact store is configured, fields exceeding
+//! `offload_threshold` are stored there instead and receive a `{"$ref": "<key>"}`
+//! marker. This keeps large payloads out of the relational DB entirely.
+//!
 //! These constants MUST match `orch8_engine::externalized::*`. A mismatch
 //! would silently break marker recognition; the `marker_shape_matches_engine`
 //! test in the storage integration suite guards against drift.
@@ -13,6 +17,10 @@
 //! See `docs/CONTEXT_MANAGEMENT.md` §8.5 for the envelope contract.
 use serde_json::{Map, Value};
 use std::io;
+
+use uuid::Uuid;
+
+use x_types::artifact::{context_artifact_key, is_offload_marker, offload_marker};
 
 /// `io::Write` sink that just tallies bytes written and discards them —
 /// used by `externalize_fields` to compute JSON-serialized length without
@@ -135,6 +143,73 @@ pub fn externalize_fields(
     }
 
     refs
+}
+
+/// Walk top-level keys of `context.data` and offload any value whose
+/// serialized size exceeds `threshold_bytes` to the artifact store,
+/// replacing it with a `{"$ref": "<artifact_key>"}` marker.
+///
+/// The artifact key format is `{instance_uuid}/ctx/{field_name}`.
+///
+/// This is the artifact-store counterpart of [`externalize_fields`]:
+/// where `externalize_fields` saves to the `externalized_state` table,
+/// `offload_fields_async` saves to the configured artifact backend
+/// (S3/MinIO/local FS).
+///
+/// Returns the number of fields offloaded.
+///
+/// # Errors
+/// Propagates artifact store errors.
+pub async fn offload_fields_async<F, Fut>(
+    data: &mut Value,
+    instance_id: &uuid::Uuid,
+    threshold_bytes: u32,
+    mut put_artifact: F,
+) -> Result<u32, x_types::error::StorageError>
+where
+    F: FnMut(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<x_types::artifact::ArtifactRef, x_types::error::StorageError>>,
+{
+    if threshold_bytes == 0 {
+        return Ok(0);
+    }
+    let Some(obj) = data.as_object_mut() else {
+        return Ok(0);
+    };
+
+    let threshold = threshold_bytes as usize;
+    let instance_uuid_str = instance_id.to_string();
+    let mut offloaded: u32 = 0;
+
+    // Collect field names first to avoid borrow conflicts.
+    let field_names: Vec<String> = obj.keys().cloned().collect();
+
+    for field in field_names {
+        let Some(value) = obj.get(&field) else {
+            continue;
+        };
+        // Skip if already a marker of any kind.
+        if is_marker(value) || is_offload_marker(value) {
+            continue;
+        }
+        // Measure serialized size.
+        let mut counter = CountingWriter::default();
+        if serde_json::to_writer(&mut counter, value).is_err() {
+            continue;
+        }
+        if counter.count < threshold {
+            continue;
+        }
+        // Serialize the value and offload to artifact store.
+        let serialized = serde_json::to_vec(value)?;
+        let artifact_key = x_types::artifact::context_artifact_key(&instance_uuid_str, &field);
+        put_artifact(artifact_key.clone(), serialized).await?;
+        // Replace with $ref marker.
+        obj.insert(field, x_types::artifact::offload_marker(&artifact_key));
+        offloaded += 1;
+    }
+
+    Ok(offloaded)
 }
 
 #[cfg(test)]

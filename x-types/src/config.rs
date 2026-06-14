@@ -101,6 +101,16 @@ pub struct SchedulerConfig {
     pub max_context_bytes: u32,
     #[serde(default)]
     pub externalize_output_threshold: u32,
+    /// Threshold in bytes above which a context.data field is automatically
+    /// offloaded to the artifact store (S3/MinIO/local FS) instead of being
+    /// stored inline or in `externalized_state`. When 0 (default), offloading
+    /// is disabled — the engine falls back to `externalize_output_threshold`
+    /// for the relational-DB externalization path.
+    ///
+    /// Requires an artifact store to be configured; if absent, offload
+    /// attempts fail with `Unsupported` and are logged as warnings.
+    #[serde(default)]
+    pub context_offload_threshold: u32,
     #[serde(default)]
     pub max_instances_per_tenant: u32,
     #[serde(default)]
@@ -132,6 +142,7 @@ impl Default for SchedulerConfig {
             webhooks: WebhookConfig::default(),
             max_context_bytes: default_max_context_bytes(),
             externalize_output_threshold: 0,
+            context_offload_threshold: 0,
             max_instances_per_tenant: 0,
             max_steps_per_instance: 0,
             cron_tick_secs: 10,

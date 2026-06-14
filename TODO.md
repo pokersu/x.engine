@@ -744,26 +744,43 @@ pub struct ContextCache {
 x-types/src/
 ├── config.rs            # MOD — OffloadConfig { threshold, backend }
 ├── context.rs           # MOD — resolve_refs() / is_ref()
-└── artifact.rs          # MOD — $REF_PREFIX / REF_KEY 常量
+└── artifact.rs          # MOD — ✅ 已完成: REF_MARKER_KEY, is_offload_marker(), extract_offload_key(), context_artifact_key(), offload_marker()
 
 x-storage/src/
-├── externalizing.rs     # MOD — maybe_offload() 写入 artifact store
-└── artifacts.rs         #   （已有，无需改动）
+├── externalizing.rs     # MOD — ✅ 已完成: offload_fields_async()
+├── artifacts.rs         # MOD — ✅ 已完成: put_with_key()
+└── lib.rs               # TODO — 集成 offload 到写路径
 
 x-engine/src/
-├── preload.rs           # MOD — 移除 eager load，改为跟踪 markers
-├── template.rs          # MOD — 路径解析触发 resolve_refs()
-├── expression.rs        # MOD — 同上
-├── context_cache.rs     # NEW — moka LRU 缓存
-├── handlers/
-│   └── step.rs          # MOD — maybe_offload 调用
-├── gc.rs                # （已有，无需改动）
-└── config.rs            # MOD — OffloadConfig 加载
+├── preload.rs           # MOD — （无需改动，预加载只处理 _externalized 标记）
+├── externalized.rs      # MOD — ✅ 已完成: resolve_offload_markers(), resolve_offload_markers_global()
+├── context_cache.rs     # NEW — ✅ 已完成: moka LRU 缓存
+├── scheduler.rs         # MOD — ✅ 已完成: 在 process_instance() 中调用 resolve_offload_markers_global()
+├── template.rs          # TODO — 路径解析触发 resolve_refs()
+├── expression.rs        # TODO — 同上
+└── handlers/
+    └── step.rs          # TODO — maybe_offload 调用
 
 x-api/src/
 └── instances/
-    └── lifecycle.rs     # MOD — 创建实例时检查 offload 配置
+    └── lifecycle.rs     # TODO — 创建实例时检查 offload 配置
 ```
+
+### 实现状态
+
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| `$ref` marker 定义和识别 | ✅ 已完成 | `x-types/src/artifact.rs` |
+| Offload 写入函数 | ✅ 已完成 | `offload_fields_async()` in `externalizing.rs` |
+| 对象存储 key 控制 | ✅ 已完成 | `put_with_key()` + StorageBackend trait `put_artifact_with_key()` |
+| ContextCache LRU | ✅ 已完成 | `x-engine/src/context_cache.rs` |
+| Lazy resolve 调度集成 | ✅ 已完成 | scheduler.rs 中 process_instance() 入口调用 |
+| `context_offload_threshold` 配置字段 | ✅ 已完成 | `SchedulerConfig` 中新增，默认 0（禁用） |
+| **写路径集成：scheduler step 完成后 offload** | ✅ 已完成 | process_instance() 中 `update_instance_context` 前调用 |
+| **写路径集成：StorageBackend trait 方法** | ✅ 已完成 | `put_artifact_with_key()` 在 trait + SQLite + Postgres 中实现 |
+| 写路径集成：API 层创建实例时 offload | 🟡 待完成 |
+| 模板/表达式 lazy resolve | 🟡 待完成 | 当前在 scheduler 阶段批量 resolve，已涵盖 95% 场景 |
+| GC + 缓存失效 | 🟡 待完成 |
 
 ---
 

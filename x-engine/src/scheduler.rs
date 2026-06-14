@@ -63,6 +63,9 @@ pub(crate) struct TickContext<'a> {
     pub batch_size: u32,
     pub max_per_tenant: u32,
     pub externalize_threshold: u32,
+    /// Threshold for automatic context field offload to artifact store.
+    /// 0 = disabled (default).
+    pub context_offload_threshold: u32,
     pub counters: Option<Arc<TickCounters>>,
 }
 
@@ -95,6 +98,7 @@ pub async fn tick_once(
         batch_size: config.batch_size,
         max_per_tenant: config.max_instances_per_tenant,
         externalize_threshold: config.externalize_output_threshold,
+        context_offload_threshold: config.context_offload_threshold,
         counters: Some(Arc::clone(&counters)),
     };
 
@@ -171,6 +175,7 @@ pub async fn run_tick_loop(
     // Share WebhookConfig via Arc to avoid cloning per instance.
     let webhook_config = Arc::new(config.webhooks.clone());
     let externalize_threshold = config.externalize_output_threshold;
+    let context_offload_threshold = config.context_offload_threshold;
 
     let mut ticker = interval(tick_duration);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -207,7 +212,7 @@ pub async fn run_tick_loop(
                     batch_size,
                     max_per_tenant: config.max_instances_per_tenant,
                     externalize_threshold,
-                    // The tick loop does not need per-tick counters — pass None.
+                    context_offload_threshold,
                     counters: None,
                 };
                 match process_tick(&ctx).await {
@@ -366,6 +371,7 @@ async fn process_tick(ctx: &TickContext<'_>) -> Result<Vec<JoinHandle<()>>, Engi
         let cancel = ctx.cancel.clone();
         let counters = ctx.counters.clone();
         let externalize_threshold = ctx.externalize_threshold;
+        let context_offload_threshold = ctx.context_offload_threshold;
         let max_steps_per_instance = ctx.max_steps_per_instance;
 
         crate::metrics::inc(crate::metrics::INSTANCES_CLAIMED);
@@ -404,6 +410,7 @@ async fn process_tick(ctx: &TickContext<'_>) -> Result<Vec<JoinHandle<()>>, Engi
                     instance,
                     data,
                     externalize_threshold,
+                    context_offload_threshold,
                     max_steps_per_instance,
                     &cancel,
                 )
@@ -948,9 +955,10 @@ async fn process_instance(
     handlers: &HandlerRegistry,
     webhook_config: &WebhookConfig,
     sequence_cache: &SequenceCache,
-    instance: x_types::instance::TaskInstance,
+    mut instance: x_types::instance::TaskInstance,
     prefetched: PrefetchedData,
     externalize_threshold: u32,
+    context_offload_threshold: u32,
     max_steps_per_instance: u32,
     cancel: &CancellationToken,
 ) -> Result<(), EngineError> {
@@ -964,7 +972,7 @@ async fn process_instance(
     // claim_due_instances already set state to Running.
     // Stamp runtime.started_at on the first run so timeout / escalation
     // handlers (e.g. human_review) can compute elapsed time.
-    let instance = if instance.context.runtime.started_at.is_none() {
+    let mut instance = if instance.context.runtime.started_at.is_none() {
         let started_at = Utc::now();
         storage
             .update_instance_started_at(instance_id, started_at)
@@ -1068,7 +1076,22 @@ async fn process_instance(
         }
     });
 
+    // Resolve any `$ref` offload markers in the instance's context before
+    // executing steps. Artifact-offloaded values are loaded lazily here
+    // (not during preload) and cached for subsequent steps/ticks.
+    crate::externalized::resolve_offload_markers_global(
+        storage.as_ref(),
+        &mut instance.context,
+    )
+    .await;
+
     if has_composite || has_plugin_handler {
+        // Resolve again for tree path (context may have been modified above).
+        crate::externalized::resolve_offload_markers_global(
+            storage.as_ref(),
+            &mut instance.context,
+        )
+        .await;
         return process_instance_tree(
             storage,
             handlers,
@@ -1143,6 +1166,17 @@ async fn process_instance(
                     .get_instance(instance_id)
                     .await?
                     .map_or_else(|| instance.context.clone(), |i| i.context);
+                // Resolve any `$ref` markers from a previous tick's offload.
+                // Without this, `offload_fields_async` below would see a `$ref`
+                // marker (skipping it), but the field may have been modified
+                // by the step handler and its new value is still inline in the
+                // DB — the resolve ensures we have real values before deciding
+                // whether to offload again.
+                crate::externalized::resolve_offload_markers_global(
+                    storage.as_ref(),
+                    &mut fresh_context,
+                )
+                .await;
                 fresh_context.runtime.total_steps_executed += 1;
 
                 if max_steps_per_instance > 0
@@ -1167,6 +1201,42 @@ async fn process_instance(
                     )
                     .await?;
                     return Ok(());
+                }
+                // Offload large context fields to artifact store before saving.
+                if context_offload_threshold > 0 {
+                    let instance_uuid = instance_id;
+                    let store = Arc::clone(storage);
+                    if let Err(e) = x_storage::externalizing::offload_fields_async(
+                        &mut fresh_context.data,
+                        &instance_uuid.into_uuid(),
+                        context_offload_threshold,
+                        |key, bytes| {
+                            let store = Arc::clone(&store);
+                            async move {
+                                store
+                                    .put_artifact_with_key(
+                                        &key,
+                                        "application/json",
+                                        bytes::Bytes::from(bytes),
+                                    )
+                                    .await
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, instance_id = %instance_id, "failed to offload context fields");
+                    }
+                    // Invalidate cached entries for this instance's offloaded
+                    // fields so the next tick reads fresh data from the
+                    // artifact store rather than stale cached values.
+                    if let Some(obj) = fresh_context.data.as_object() {
+                        for value in obj.values() {
+                            if let Some(key) = x_types::artifact::extract_offload_key(value) {
+                                crate::externalized::invalidate_cache_key(key);
+                            }
+                        }
+                    }
                 }
                 storage
                     .update_instance_context(instance_id, &fresh_context)

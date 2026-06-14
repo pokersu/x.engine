@@ -74,11 +74,11 @@ x.engine/
 ### 构建与测试状态
 
 - **编译**: `cargo build --workspace` — 0 errors
-- **测试**: `cargo test --workspace --lib` — **1334 passed, 0 failed**
+- **测试**: `cargo test --workspace --lib` — **1341 passed, 0 failed**
   - `x-types`: 132 个测试
   - `x-storage`: 83 个测试
-  - `x-engine`: 1109 个测试
-  - `x-api`: 10 个测试
+  - `x-engine`: 1114 个测试
+  - `x-api`: 12 个测试
 
 ### 核心保留特性
 
